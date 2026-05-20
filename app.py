@@ -23,7 +23,6 @@ from one_page_setup_sheet import (
     strip_editor_ui_columns,
 )
 from feedback_form import render_parser_feedback_form
-from setup_sheet_parser import combine_gcode_and_setup_sheet, parse_setup_sheet_pdf
 
 _CNC_TEXT_ERROR = "This file could not be read as a text-based CNC program."
 
@@ -206,8 +205,8 @@ st.set_page_config(
 )
 st.title("Shop Floor — One-Page Setup Sheet")
 st.caption(
-    f"{BETA_VERSION_LABEL} — Upload your G-code and setup sheet to create a "
-    "clean one-page shop-floor setup sheet."
+    f"{BETA_VERSION_LABEL} — Upload your G-code to create a clean one-page "
+    "shop-floor setup sheet."
 )
 st.warning(BETA_SHOP_FLOOR_WARNING)
 st.info(f"**Privacy note:** {BETA_PRIVACY_NOTE}")
@@ -217,15 +216,8 @@ uploaded_file = st.file_uploader(
     help=f"Accepted: {_CNC_EXTENSIONS_HINT}",
 )
 st.caption(
-    "CNC program: .nc, .tap, .txt, .gcode, .min, .eia, .mpf, .h, .cnc — "
-    "or no extension (e.g. O3618, Siemens .MPF)"
+    "Supported files: .nc, .txt, .tap, .gcode, .mpf, .min, .eia, or text-based CNC files."
 )
-
-uploaded_pdf = st.file_uploader(
-    "Upload setup sheet PDF",
-    type=["pdf"],
-)
-st.caption("Setup sheet: PDF exported from Mastercam or similar CAM software")
 
 if uploaded_file is None:
     st.info("Upload a G-code file to begin.")
@@ -239,19 +231,12 @@ if _decode_err:
     st.stop()
 
 result = parse_gcode(raw_text)
-
+# Free Beta v0.1: G-code only — setup sheet PDF upload is disabled in the UI.
 setup_sheet = None
-if uploaded_pdf is not None:
-    setup_sheet = parse_setup_sheet_pdf(uploaded_pdf.getvalue())
 
 
 def _opsheet_analysis_key():
-    parts = [uploaded_file.name, str(uploaded_file.size)]
-    if uploaded_pdf is not None:
-        parts.extend([uploaded_pdf.name, str(uploaded_pdf.size)])
-    else:
-        parts.extend(["", "0"])
-    return "|".join(parts)
+    return "|".join([uploaded_file.name, str(uploaded_file.size)])
 
 
 _opsheet_ak = _opsheet_analysis_key()
@@ -279,10 +264,6 @@ if st.session_state.get("_opsheet_ak") != _opsheet_ak:
     st.session_state["shopfloor_generated"] = False
     st.session_state["opsheet_delete_mode"] = False
     st.session_state["operation_rows_user_modified"] = False
-    if setup_sheet and setup_sheet.get("tools"):
-        st.session_state["opsheet_tools_df"] = pd.DataFrame(setup_sheet["tools"])
-    else:
-        st.session_state.pop("opsheet_tools_df", None)
 
 if "shopfloor_generated" not in st.session_state:
     st.session_state["shopfloor_generated"] = False
@@ -313,9 +294,6 @@ if "opsheet_created_by" not in st.session_state:
     st.session_state["opsheet_created_by"] = ""
 if "opsheet_fixture" not in st.session_state:
     st.session_state["opsheet_fixture"] = ""
-
-if setup_sheet and setup_sheet.get("tools") and st.session_state.get("opsheet_tools_df") is None:
-    st.session_state["opsheet_tools_df"] = pd.DataFrame(setup_sheet["tools"])
 
 gen_top = st.button("Generate Setup Sheet", type="primary", key="opsheet_generate_btn")
 if gen_top:
@@ -635,62 +613,6 @@ with st.expander("Advanced / Diagnostic Data", expanded=False):
     else:
         st.write("No header tool list found.")
 
-    if setup_sheet:
-        st.subheader("Setup Sheet Summary")
-        ss_meta = {
-            "project_name": setup_sheet.get("project_name", "-"),
-            "customer_name": setup_sheet.get("customer_name", "-"),
-            "programmer": setup_sheet.get("programmer", "-"),
-            "drawing": setup_sheet.get("drawing", "-"),
-            "revision": setup_sheet.get("revision", "-"),
-            "date": setup_sheet.get("date", "-"),
-            "comments": setup_sheet.get("comments", "-"),
-            "total_cycle_time": setup_sheet.get("total_cycle_time", "-"),
-        }
-        st.dataframe(pd.DataFrame([ss_meta]), use_container_width=True)
-        ops = setup_sheet.get("operation_list") or []
-        if ops:
-            st.caption("Operations (from PDF)")
-            st.dataframe(pd.DataFrame({"Operation": ops}), use_container_width=True)
-
-        st.subheader("Tool List From Setup Sheet")
-        ss_tools = setup_sheet.get("tools") or []
-        if ss_tools:
-            st.dataframe(pd.DataFrame(ss_tools), use_container_width=True)
-        else:
-            st.info("No tools extracted. See raw extracted text below.")
-
-        st.markdown("**Tool list from setup sheet PDF (editable)**")
-        if st.session_state.get("opsheet_tools_df") is not None:
-            _tdf = st.data_editor(
-                st.session_state["opsheet_tools_df"],
-                key="opsheet_tools_editor",
-                num_rows="dynamic",
-                use_container_width=True,
-            )
-            st.session_state["opsheet_tools_df"] = _tdf
-        else:
-            st.caption("No tool table extracted from this PDF.")
-
-        st.subheader("Raw extracted PDF text")
-        raw_full = setup_sheet.get("full_text") or ""
-        st.text_area(
-            "Extracted PDF text",
-            value=raw_full,
-            height=400,
-            key="setup_sheet_raw_text_debug",
-            label_visibility="collapsed",
-        )
-        st.download_button(
-            label="Download extracted PDF text (.txt)",
-            data=raw_full.encode("utf-8", errors="replace"),
-            file_name="setup_sheet_extracted.txt",
-            mime="text/plain",
-            key="download_setup_sheet_txt",
-        )
-    else:
-        st.caption("Upload a setup sheet PDF to see setup-sheet diagnostics here.")
-
     st.subheader("Operation Blocks by N Number")
     operation_blocks = result.get("operation_blocks", [])
     if operation_blocks:
@@ -737,14 +659,6 @@ with st.expander("Advanced / Diagnostic Data", expanded=False):
         st.dataframe(operation_df, use_container_width=True)
     else:
         st.write("No operation blocks found.")
-
-    if setup_sheet and result.get("tool_rows"):
-        st.subheader("G-code vs Setup Sheet (by tool number)")
-        combined_rows = combine_gcode_and_setup_sheet(result, setup_sheet)
-        if combined_rows:
-            st.dataframe(pd.DataFrame(combined_rows), use_container_width=True)
-        else:
-            st.write("No matching tools to compare.")
 
     st.subheader("Comments (Parentheses)")
     if result["comments"]:
