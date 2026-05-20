@@ -1,5 +1,8 @@
 import base64
+import io
 import re
+import zipfile
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -197,6 +200,19 @@ def _build_opsheet_html_from_session() -> str:
 def _render_beta_footer() -> None:
     st.markdown("---")
     st.caption(BETA_FOOTER_TEXT)
+
+
+def _build_zip_bytes_from_folder(folder: Path) -> bytes | None:
+    if not folder.exists() or not folder.is_dir():
+        return None
+    files = [p for p in sorted(folder.rglob("*")) if p.is_file()]
+    if not files:
+        return None
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for file_path in files:
+            zf.write(file_path, arcname=str(file_path.relative_to(folder)))
+    return buffer.getvalue()
 
 
 st.set_page_config(
@@ -666,6 +682,44 @@ with st.expander("Advanced / Diagnostic Data", expanded=False):
         st.dataframe(comments_df, use_container_width=True)
     else:
         st.write("No comments found.")
+
+    st.subheader("Admin — Feedback Downloads")
+    feedback_root = Path(__file__).resolve().parent / "feedback"
+    feedback_csv = feedback_root / "feedback_log.csv"
+    feedback_uploads = feedback_root / "uploads"
+    feedback_snippets = feedback_root / "snippets"
+
+    has_csv = feedback_csv.exists() and feedback_csv.is_file() and feedback_csv.stat().st_size > 0
+    uploads_zip = _build_zip_bytes_from_folder(feedback_uploads)
+    snippets_zip = _build_zip_bytes_from_folder(feedback_snippets)
+
+    if not has_csv and not uploads_zip and not snippets_zip:
+        st.caption("No feedback collected yet.")
+    else:
+        if has_csv:
+            st.download_button(
+                label="Download feedback_log.csv",
+                data=feedback_csv.read_bytes(),
+                file_name="feedback_log.csv",
+                mime="text/csv",
+                key="admin_download_feedback_csv",
+            )
+        if uploads_zip:
+            st.download_button(
+                label="Download all uploaded feedback files as ZIP",
+                data=uploads_zip,
+                file_name="feedback_uploads.zip",
+                mime="application/zip",
+                key="admin_download_feedback_uploads_zip",
+            )
+        if snippets_zip:
+            st.download_button(
+                label="Download all pasted snippets as ZIP",
+                data=snippets_zip,
+                file_name="feedback_snippets.zip",
+                mime="application/zip",
+                key="admin_download_feedback_snippets_zip",
+            )
 
 st.markdown("---")
 _render_beta_footer()
