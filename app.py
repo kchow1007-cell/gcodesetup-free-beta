@@ -602,8 +602,11 @@ else:
 
 render_parser_feedback_form()
 
-st.divider()
-with st.expander("Advanced / Diagnostic Data", expanded=False):
+if "admin_unlocked" not in st.session_state:
+    st.session_state["admin_unlocked"] = False
+
+
+def _render_admin_diagnostics() -> None:
     st.subheader("Program Summary")
     summary_df = pd.DataFrame([result["summary"]])
     st.table(summary_df)
@@ -720,6 +723,32 @@ with st.expander("Advanced / Diagnostic Data", expanded=False):
                 mime="application/zip",
                 key="admin_download_feedback_snippets_zip",
             )
+
+
+st.divider()
+with st.expander("Advanced / Diagnostic Data", expanded=False):
+    admin_password = st.secrets.get("ADMIN_PASSWORD")
+    if not admin_password:
+        st.warning("Admin password is not configured.")
+    elif st.session_state.get("admin_unlocked"):
+        _lock_col, _ = st.columns([1, 4])
+        with _lock_col:
+            if st.button("Lock Admin Panel", key="admin_lock_panel_btn"):
+                st.session_state["admin_unlocked"] = False
+                st.rerun()
+        _render_admin_diagnostics()
+    else:
+        entered_password = st.text_input(
+            "Enter admin password",
+            type="password",
+            key="admin_password_input",
+        )
+        if st.button("Unlock", key="admin_unlock_btn"):
+            if entered_password == str(admin_password):
+                st.session_state["admin_unlocked"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password")
 
 st.markdown("---")
 _render_beta_footer()
