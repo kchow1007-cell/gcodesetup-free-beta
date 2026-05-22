@@ -72,12 +72,31 @@ def _inject_preview_chrome(html_doc: str) -> str:
   .sf-page-outer, .setup-sheet-page {
     width: 100%; max-width: none; box-shadow: none; border: none; padding: 0;
   }
+  .setup-sheet-page td,
+  .setup-sheet-page th {
+    overflow: visible !important;
+    white-space: normal !important;
+    word-break: break-word !important;
+  }
+  .datum-value,
+  .setup-notes-value,
+  .machine-fixture-datum-value {
+    height: auto !important;
+    min-height: auto;
+    overflow: visible !important;
+    white-space: pre-line !important;
+  }
   .operation-section { break-inside: auto; page-break-inside: auto; }
   .operation-section:first-of-type { margin-top: 6px; page-break-before: auto; break-before: auto; }
   .operation-table { break-inside: auto; page-break-inside: auto; }
   .operation-section-title { break-after: avoid; page-break-after: avoid; }
   .operation-table thead { display: table-header-group; }
   tr { break-inside: avoid; page-break-inside: avoid; }
+  .op-sheet-table td {
+    height: auto !important;
+    overflow: visible !important;
+    white-space: normal !important;
+  }
   .logo-cell {
     width: 150px !important; min-width: 150px !important; max-width: 150px !important;
     height: 85px !important;
@@ -193,7 +212,7 @@ def _build_opsheet_html_from_session() -> str:
         st.session_state["opsheet_op_df"],
         logo_b64=_logo_b64,
         logo_mime=_logo_mime,
-        preserve_operation_order=st.session_state.get("operation_rows_user_modified", False),
+        preserve_operation_order=True,
     )
 
 

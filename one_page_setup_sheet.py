@@ -44,6 +44,7 @@ CLEARABLE_OPERATION_COLUMNS = (
     "Remark",
 )
 _EDITOR_UI_COLS = ("Select", "Delete?")
+_INTERNAL_COLS = ("sequence_index",)
 _DATUM_SECTION_HEADER_BG = "#b4d7ee"
 
 
@@ -139,11 +140,9 @@ def block_sort_key(block: Any) -> tuple:
 
 
 def maybe_sort_operation_rows(df: pd.DataFrame, user_modified: bool) -> pd.DataFrame:
-    """Sort only when rows are still in initial parsed order (not manually edited)."""
-    if user_modified:
-        out = strip_editor_ui_columns(df)
-        return out.reset_index(drop=True)
-    return sort_operation_rows(df)
+    """Preserve editor row order; never auto-sort by datum/tool/block."""
+    del user_modified  # kept for call-site compatibility
+    return strip_editor_ui_columns(df).reset_index(drop=True)
 
 
 def sort_operation_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -163,10 +162,10 @@ def sort_operation_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def strip_editor_ui_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove Select / Delete? helper columns before save or preview."""
+    """Remove Select / Delete? and internal columns before save or preview."""
     if df is None or df.empty:
         return df.copy() if df is not None else pd.DataFrame()
-    drop = [c for c in _EDITOR_UI_COLS if c in df.columns]
+    drop = [c for c in _EDITOR_UI_COLS + _INTERNAL_COLS if c in df.columns]
     if drop:
         return df.drop(columns=drop)
     return df.copy()
@@ -317,10 +316,16 @@ def default_operation_editor_rows(
     **Tool Description** uses only ``operation_blocks`` fields (see
     ``_tool_description_from_operation_block``); setup sheet PDF tool list is not used here.
     """
-    blocks = result.get("operation_blocks") or []
-    summary_wo = (result.get("summary") or {}).get("work_offsets", "-")
-    datums = _sorted_datums(summary_wo, blocks)
-    primary = datums[0] if datums else "(no datum detected)"
+    blocks = sorted(
+        result.get("operation_blocks") or [],
+        key=lambda ob: ob.get("sequence_index", 0),
+    )
+    primary = "(no datum detected)"
+    for ob in blocks:
+        wo_raw = (ob.get("work_offsets") or "-").strip()
+        if wo_raw and wo_raw != "-":
+            primary = wo_raw.split(",")[0].strip()
+            break
 
     rows_out: List[Dict[str, Any]] = []
     for ob in blocks:
@@ -336,9 +341,11 @@ def default_operation_editor_rows(
         tn = ob.get("tool_number") or "-"
         tdesc = _tool_description_from_operation_block(ob)
 
+        seq = ob.get("sequence_index", len(rows_out))
         for datum in tokens:
             rows_out.append(
                 {
+                    "sequence_index": seq,
                     "Datum": datum,
                     "Tool#": tn,
                     "Block#": ob.get("block_number") or "-",
@@ -367,7 +374,7 @@ def default_operation_editor_rows(
             }
         )
 
-    return sort_operation_rows(pd.DataFrame(rows_out))
+    return pd.DataFrame(rows_out)
 
 
 def default_metadata(result=None, setup_sheet=None) -> Dict[str, str]:
@@ -408,31 +415,35 @@ _OP_TABLE_COLGROUP = (
 
 def group_editor_rows_by_datum(
     df: pd.DataFrame,
-    preserve_order: bool = False,
+    preserve_order: bool = True,
 ) -> List[Tuple[str, pd.DataFrame]]:
-    """Return (datum, rows) groups; sorted by offset unless ``preserve_order``."""
+    """
+    Return (datum, rows) groups in program order.
+
+    Uses contiguous datum runs so interleaved offsets (G54, G55, G54) are not merged.
+    """
+    del preserve_order  # always program order
     if df is None or df.empty:
         return []
     work = strip_editor_ui_columns(df).reset_index(drop=True)
-    if not preserve_order:
-        work = sort_operation_rows(work)
-        unique = sorted(
-            {normalize_datum_label(d) for d in work["Datum"].astype(str).tolist() if str(d).strip()},
-            key=datum_sort_key,
-        )
-    else:
-        unique = []
-        seen = set()
-        for d in work["Datum"].astype(str).tolist():
-            nd = normalize_datum_label(d)
-            if nd and nd not in seen:
-                seen.add(nd)
-                unique.append(nd)
     out: List[Tuple[str, pd.DataFrame]] = []
-    for d in unique:
-        sub = work[work["Datum"].astype(str).apply(normalize_datum_label) == d].copy()
-        if not sub.empty:
-            out.append((d, sub))
+    current_label = None
+    chunk_rows: List[Dict[str, Any]] = []
+
+    def _flush() -> None:
+        nonlocal chunk_rows, current_label
+        if chunk_rows and current_label is not None:
+            out.append((current_label, pd.DataFrame(chunk_rows)))
+        chunk_rows = []
+
+    for _, row in work.iterrows():
+        label = normalize_datum_label(row.get("Datum", "")) or "(no datum detected)"
+        if label != current_label:
+            _flush()
+            current_label = label
+        chunk_rows.append(row.to_dict())
+
+    _flush()
     return out
 
 
@@ -441,7 +452,7 @@ def build_one_page_html(
     op_df: pd.DataFrame,
     logo_b64: Optional[str] = None,
     logo_mime: Optional[str] = None,
-    preserve_operation_order: bool = False,
+    preserve_operation_order: bool = True,
 ) -> str:
     """
     meta keys include: part_number, material, part_description, stock_size, customer,
@@ -450,9 +461,10 @@ def build_one_page_html(
     """
     allowed_logo_mimes = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"}
     preview_df = filter_empty_operation_rows(op_df)
-    if not preserve_operation_order:
-        preview_df = sort_operation_rows(preview_df)
-    grouped = group_editor_rows_by_datum(preview_df, preserve_order=preserve_operation_order)
+    grouped = group_editor_rows_by_datum(
+        preview_df,
+        preserve_order=preserve_operation_order,
+    )
 
     if logo_b64 and logo_mime:
         safe_mime = logo_mime if logo_mime in allowed_logo_mimes else "image/png"
@@ -497,8 +509,8 @@ def build_one_page_html(
     machine = meta.get("machine", "")
     fixture = meta.get("fixture", "")
     dl_raw = meta.get("datum_lines", "") or ""
-    datum_lines_html = "<br/>".join(_esc(x) for x in dl_raw.splitlines())
-    setup_notes_html = _esc(meta.get("setup_notes", "")).replace("\n", "<br/>")
+    datum_lines_html = "\n".join(_esc(x) for x in dl_raw.splitlines()) if dl_raw else ""
+    setup_notes_html = _esc(meta.get("setup_notes", ""))
 
     def _cell(val: Any) -> str:
         if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -548,11 +560,103 @@ def build_one_page_html(
         )
 
     op_style = """<style type="text/css">
+.setup-sheet-page { font-family: Arial, Helvetica, sans-serif; background: #fff; color: #000; }
+.setup-sheet-page td,
+.setup-sheet-page th {
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+  box-sizing: border-box;
+}
+.header-table { width: 100%; table-layout: fixed; border-collapse: collapse; }
+.logo-cell {
+  width: 150px; min-width: 150px; max-width: 150px; height: 85px; padding: 4px;
+  box-sizing: border-box; vertical-align: middle; text-align: center;
+  border: 1px solid #000; overflow: hidden;
+}
+.logo-box {
+  width: 100%; height: 100%; border: 1px dashed #777; display: flex; align-items: center;
+  justify-content: center; box-sizing: border-box; overflow: hidden; text-align: center;
+}
+.logo-box img {
+  max-width: 100%; max-height: 100%; object-fit: contain; display: block;
+}
+.logo-placeholder {
+  font-size: 11px; font-weight: bold; line-height: 1.1; white-space: normal; max-width: 100%;
+  padding: 2px;
+}
+.logo-text-screen { display: inline; }
+.logo-text-print { display: none; }
+.machine-fixture-datum-value {
+  min-height: 60px;
+  height: auto;
+  padding: 4px 6px;
+  line-height: 1.25;
+  white-space: pre-line;
+  overflow: visible;
+  font-size: 10px;
+  box-sizing: border-box;
+}
+.datum-value {
+  white-space: pre-line;
+  min-height: 70px;
+  height: auto;
+  line-height: 1.25;
+  overflow: visible;
+}
+.setup-notes-value {
+  min-height: 80px;
+  height: auto;
+  white-space: pre-line;
+  overflow: visible;
+  padding: 4px 6px;
+  line-height: 1.25;
+  font-size: 10px;
+  box-sizing: border-box;
+}
+.sheet-section-title { font-size: 11px; font-weight: bold; background: #d9d9d9; padding: 2px 5px;
+  border-bottom: 1px solid #000; }
+.sheet-section-body { font-size: 10px; }
+.machine-fixture-row { margin-top: 6px; }
+.setup-notes-wrap { margin-top: 6px; border: 1px solid #000; }
+.operation-section { margin-top: 8px; break-inside: auto; }
+.operation-section:first-of-type { margin-top: 6px; page-break-before: auto; break-before: auto; }
+.op-sheet-table { table-layout: fixed; width: 100%; border-collapse: collapse; margin-top: 0; }
+.op-sheet-table th { font-size: 10px; font-weight: bold; border: 1px solid #000; padding: 2px 4px;
+  height: 16px; vertical-align: middle; box-sizing: border-box; background: #e8e8e8;
+  white-space: normal; }
+.op-sheet-table td { font-size: 9px; border: 1px solid #000; padding: 2px 4px;
+  min-height: 16px; height: auto; vertical-align: top; box-sizing: border-box;
+  overflow: visible; white-space: normal; word-break: break-word; overflow-wrap: anywhere; }
+.operation-section-title td { background: #b4d7ee; font-size: 11px; font-weight: bold; text-align: center;
+  padding: 4px; border: 1px solid #000; break-after: avoid; page-break-after: avoid; }
+.operation-table thead { display: table-header-group; }
+.prepared-row { margin-top: 6px; font-size: 10px; }
+.prepared-row td { padding: 4px 6px; border: 1px solid #000; }
+.sheet-beta-footer {
+  margin-top: 10px; padding: 6px 8px; font-size: 9px; color: #444;
+  text-align: center; border-top: 1px solid #ccc;
+}
 @media print {
   @page { size: letter portrait; margin: 0.25in; }
   body { margin: 0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .setup-sheet-page { width: 100%; max-width: none; box-shadow: none; border: none; padding: 0; }
   .no-print { display: none !important; }
+  .setup-sheet-page td,
+  .setup-sheet-page th {
+    overflow: visible !important;
+    white-space: normal !important;
+    word-break: break-word !important;
+  }
+  .datum-value,
+  .setup-notes-value,
+  .machine-fixture-datum-value {
+    height: auto !important;
+    min-height: auto;
+    overflow: visible !important;
+    white-space: pre-line !important;
+  }
   .logo-cell {
     width: 150px !important; min-width: 150px !important; max-width: 150px !important;
     height: 85px !important;
@@ -568,52 +672,11 @@ def build_one_page_html(
   .operation-section-title { break-after: avoid; page-break-after: avoid; }
   .operation-table thead { display: table-header-group; }
   tr { break-inside: avoid; page-break-inside: avoid; }
-}
-.setup-sheet-page { font-family: Arial, Helvetica, sans-serif; background: #fff; color: #000; }
-.header-table { width: 100%; table-layout: fixed; border-collapse: collapse; }
-.logo-cell {
-  width: 150px; min-width: 150px; max-width: 150px; height: 85px; padding: 4px;
-  box-sizing: border-box; vertical-align: middle; text-align: center;
-  border: 1px solid #000;
-}
-.logo-box {
-  width: 100%; height: 100%; border: 1px dashed #777; display: flex; align-items: center;
-  justify-content: center; box-sizing: border-box; overflow: hidden; text-align: center;
-}
-.logo-box img {
-  max-width: 100%; max-height: 100%; object-fit: contain; display: block;
-}
-.logo-placeholder {
-  font-size: 11px; font-weight: bold; line-height: 1.1; white-space: normal; max-width: 100%;
-  padding: 2px;
-}
-.logo-text-screen { display: inline; }
-.logo-text-print { display: none; }
-.machine-datum-box { min-height: 55px; max-height: 55px; overflow: hidden; padding: 4px 6px;
-  font-size: 10px; box-sizing: border-box; }
-.setup-notes-box { min-height: 70px; max-height: 70px; overflow: hidden; padding: 4px 6px;
-  font-size: 10px; line-height: 1.25; box-sizing: border-box; }
-.sheet-header-table td { padding: 2px 5px; }
-.sheet-section-title { font-size: 11px; font-weight: bold; background: #d9d9d9; padding: 2px 5px;
-  border-bottom: 1px solid #000; }
-.sheet-section-body { font-size: 10px; padding: 4px 6px; }
-.machine-fixture-row { margin-top: 6px; }
-.setup-notes-wrap { margin-top: 6px; border: 1px solid #000; }
-.operation-section { margin-top: 8px; break-inside: auto; }
-.operation-section:first-of-type { margin-top: 6px; page-break-before: auto; break-before: auto; }
-.op-sheet-table { table-layout: fixed; width: 100%; border-collapse: collapse; margin-top: 0; }
-.op-sheet-table th { font-size: 10px; font-weight: bold; border: 1px solid #000; padding: 2px 4px;
-  height: 16px; vertical-align: middle; box-sizing: border-box; background: #e8e8e8; }
-.op-sheet-table td { font-size: 9px; border: 1px solid #000; padding: 2px 4px; height: 16px;
-  vertical-align: middle; box-sizing: border-box; overflow: hidden; word-wrap: break-word; }
-.operation-section-title td { background: #b4d7ee; font-size: 11px; font-weight: bold; text-align: center;
-  padding: 4px; border: 1px solid #000; break-after: avoid; page-break-after: avoid; }
-.operation-table thead { display: table-header-group; }
-.prepared-row { margin-top: 6px; font-size: 10px; }
-.prepared-row td { padding: 4px 6px; border: 1px solid #000; }
-.sheet-beta-footer {
-  margin-top: 10px; padding: 6px 8px; font-size: 9px; color: #444;
-  text-align: center; border-top: 1px solid #ccc;
+  .op-sheet-table td {
+    height: auto !important;
+    overflow: visible !important;
+    white-space: normal !important;
+  }
 }
 </style>"""
 
@@ -638,25 +701,25 @@ def build_one_page_html(
 <tr>
 <td style="width:50%;border-right:1px solid #000;padding:0;vertical-align:top;">
 <div class="sheet-section-title">MACHINE</div>
-<div class="sheet-section-body machine-datum-box">{_esc(machine)}</div>
+<div class="sheet-section-body machine-fixture-datum-value">{_esc(machine)}</div>
 </td>
 <td style="width:50%;padding:0;vertical-align:top;">
 <div class="sheet-section-title">FIXTURE</div>
-<div class="sheet-section-body machine-datum-box">{_esc(fixture)}</div>
+<div class="sheet-section-body machine-fixture-datum-value">{_esc(fixture)}</div>
 </td>
 </tr>
 </table>
 </td>
 <td style="width:50%;border:1px solid #000;padding:0;vertical-align:top;">
 <div class="sheet-section-title">DATUM</div>
-<div class="sheet-section-body machine-datum-box">{datum_lines_html}</div>
+<div class="sheet-section-body machine-fixture-datum-value datum-value">{datum_lines_html}</div>
 </td>
 </tr>
 </table>
 
 <div class="setup-notes-wrap">
 <div class="sheet-section-title">SETUP NOTES</div>
-<div class="sheet-section-body setup-notes-box">{setup_notes_html}</div>
+<div class="sheet-section-body setup-notes-value">{setup_notes_html}</div>
 </div>
 
 {"".join(op_sections_html)}

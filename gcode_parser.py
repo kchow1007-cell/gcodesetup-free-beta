@@ -9,7 +9,11 @@ G43_G44_RE = re.compile(r"G4[34]", re.IGNORECASE)
 # Integer tool-length H only (H01→H1); rejects H0.03 / macro decimals on G43/G44 lines.
 G43_G44_H_RE = re.compile(r"H0*([1-9]\d*)(?![0-9.])", re.IGNORECASE)
 G41_G42_RE = re.compile(r"G4[12]", re.IGNORECASE)
-G41_G42_D_RE = re.compile(r"D0*([1-9]\d*)(?![0-9.])", re.IGNORECASE)
+# D21, D21.0, D021 on G41/G42 lines only (not TOOL DIA.:D0.055 in comments).
+G41_G42_D_RE = re.compile(
+    r"(?<![A-Z])D0*([1-9]\d*)(?:\.\d+)?(?![0-9])",
+    re.IGNORECASE,
+)
 D_RE = re.compile(r"D(\d+)", re.IGNORECASE)
 NUM_RE = r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))"
 S_RE = re.compile(r"S" + NUM_RE, re.IGNORECASE)
@@ -115,11 +119,94 @@ def _extract_cutter_comp_d_offsets(clean_line):
     return found
 
 
+def _is_coolant_only_line(clean_line):
+    """``M8`` / ``M9`` alone — coolant, not an operation block."""
+    return bool(re.match(r"^M[89]\s*$", clean_line.strip(), re.IGNORECASE))
+
+
+def _is_m6_tool_change_line(clean_line):
+    """``M6 T7``, ``M06 T13``, ``T7 M6`` — Fanuc tool change without ``N####``."""
+    if not M6_RE.search(clean_line):
+        return False
+    return _tool_number_from_tool_change_line(clean_line) is not None or (
+        TOOL_RE.search(clean_line) is not None and not _is_coolant_only_line(clean_line)
+    )
+
+
+def _is_tool_change_boundary_line(clean_line, line_idx, start_idx):
+    """Stop collecting preamble when crossing a prior tool-change line."""
+    if line_idx == start_idx:
+        return False
+    if _is_m6_tool_change_line(clean_line):
+        return True
+    return bool(STANDALONE_TOOL_RE.match(clean_line.strip()))
+
+
+def _tool_number_from_tool_comment(comment):
+    """``TOOL - 7`` in Mastercam-style tool comments."""
+    if not comment:
+        return None
+    match = re.search(r"TOOL\s*[-–—]\s*(\d+)", comment, re.IGNORECASE)
+    if match:
+        return "T%d" % int(match.group(1))
+    return None
+
+
+def _extract_d_offset_from_dia_off_comment(comment):
+    """
+    Explicit cutter-comp offset from tool comments (``DIA. OFF. - 14``).
+    Ignores tool diameter tokens such as ``TOOL DIA.:D0.055`` or ``DIA .375``.
+    """
+    if not comment:
+        return None
+    c = comment.strip()
+    if re.search(r"TOOL\s+DIA", c, re.IGNORECASE) and not re.search(
+        r"DIA\.?\s*OFF", c, re.IGNORECASE
+    ):
+        return None
+    dia_off_match = re.search(r"(\d+)\s+DIA\.?\s*OFF", c, re.IGNORECASE)
+    if dia_off_match:
+        return "D%d" % int(dia_off_match.group(1))
+    dia_off_trailing = re.search(
+        r"DIA\.?\s*OFF\.?\s*[-–—]?\s*(\d+)", c, re.IGNORECASE
+    )
+    if dia_off_trailing:
+        return "D%d" % int(dia_off_trailing.group(1))
+    return None
+
+
+def _apply_d_offset_fallback_from_tool_comment(block_stats):
+    """
+    After scanning the operation section, add explicit D offsets from tool comments
+    (DIA. OFF., Siemens ``- D1 -``, Mastercam ``D=#``). Never from tool diameter
+    (``TOOL DIA.:D0.055``). G41/G42 D values collected on motion lines take precedence
+    but both may appear (e.g. ``D1, D3``).
+    """
+    if not block_stats.get("tool_comment"):
+        return
+    comment = block_stats["tool_comment"]
+    dia_off = _extract_d_offset_from_dia_off_comment(comment)
+    if dia_off:
+        block_stats["d_offsets"].add(dia_off)
+        return
+    info = _extract_tool_info_from_comment(comment)
+    if info and info.get("d_offset"):
+        block_stats["d_offsets"].add(info["d_offset"])
+
+
 def _is_preload_tool_line(clean_line, tool_change_seen_in_block):
-    """Standalone ``T#`` after a tool change in the same operation — preload, not active tool."""
+    """
+    After a tool change, ignore preload-only tool tokens:
+    standalone ``T#``, or ``G43 H# ... T#`` next-tool calls (Brother).
+    """
     if not tool_change_seen_in_block:
         return False
-    return bool(STANDALONE_TOOL_RE.match(clean_line.strip()))
+    line = clean_line.strip()
+    if STANDALONE_TOOL_RE.match(line):
+        return True
+    if G43_G44_RE.search(line) and TOOL_RE.search(line) and not G100_RE.search(line):
+        return True
+    return False
 
 
 def _n_block_numeric(n_label):
@@ -295,10 +382,14 @@ def _tool_number_from_clean_line(clean_line):
 
 
 def _tool_number_from_tool_change_line(clean_line):
-    """T# from combined tool-change lines: T6M6, T6 M6."""
+    """T# from combined tool-change lines: T6M6, T6 M6, N11135T5M6."""
     match = TOOL_CHANGE_SAME_LINE_RE.search(clean_line)
     if match:
         return "T%d" % int(match.group(1))
+    if M6_RE.search(clean_line):
+        fusion_style = re.search(r"T(\d+)\s*M0?6", clean_line, re.IGNORECASE)
+        if fusion_style:
+            return "T%d" % int(fusion_style.group(1))
     return None
 
 
@@ -587,8 +678,17 @@ _MAKINO_METADATA_COMMENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Autodesk Fusion post — ``TOOLPATH :`` starts a section; other TOOLPATH* lines are metadata.
+_FUSION_TOOLPATH_OP_RE = re.compile(r"^\s*TOOLPATH\s*:\s*(.+)$", re.IGNORECASE)
+_FUSION_TOOL_NAME_RE = re.compile(r"^\s*TOOL\s+NAME\s*:\s*(.+)$", re.IGNORECASE)
+_FUSION_TOOL_TYPE_RE = re.compile(r"^\s*TOOL\s+TYPE\s*:\s*(.+)$", re.IGNORECASE)
+_FUSION_METADATA_COMMENT_RE = re.compile(
+    r"^(?:STRATEGY\s+USED|TOOLPATH\s+WP|TOOL\s+TYPE|TOOL\s+DIA|TIP\s+RAD|LENGTH)\b",
+    re.IGNORECASE,
+)
+
 _CAM_PROCESS_COMMENT_PATTERNS = (
-    r"^TOOLPATH\b",
+    r"^TOOLPATH\s+WP\b",
     r"TOOLPATH\s*[-–—]",
     r"STOCK\s+LEFT",
     r"STOCK\s+LEFT\s+ON\s+DRIVE\s+SURFS",
@@ -611,6 +711,7 @@ _TOOL_WORD_PATTERNS = (
     r"FACE\s*MILL",
     r"\bE/M\b",
     r"\bEM\b",
+    r"\bFL\b",
     r"\bNOSED\b",
     r"COUNTERBORE",
     r"ROUGHING",
@@ -779,6 +880,166 @@ def _is_makino_metadata_comment(comment):
     if not comment:
         return False
     return bool(_MAKINO_METADATA_COMMENT_RE.match(comment.strip()))
+
+
+def _is_fusion_separator_comment(comment):
+    if not comment:
+        return True
+    compact = re.sub(r"\s+", "", comment.strip())
+    if not compact:
+        return True
+    return bool(re.fullmatch(r"=+", compact))
+
+
+def _is_fusion_metadata_comment(comment):
+    if not comment or _is_fusion_separator_comment(comment):
+        return True
+    if _parse_fusion_toolpath_comment(comment):
+        return False
+    return bool(_FUSION_METADATA_COMMENT_RE.match(comment.strip()))
+
+
+def _parse_fusion_toolpath_comment(comment):
+    if not comment:
+        return None
+    match = _FUSION_TOOLPATH_OP_RE.match(comment.strip())
+    if not match:
+        return None
+    text = match.group(1).strip()
+    return text if text else None
+
+
+def _parse_fusion_tool_name(comment):
+    if not comment:
+        return None
+    match = _FUSION_TOOL_NAME_RE.match(comment.strip())
+    if not match:
+        return None
+    text = match.group(1).strip()
+    return text if text else None
+
+
+def _parse_fusion_tool_type(comment):
+    if not comment:
+        return None
+    match = _FUSION_TOOL_TYPE_RE.match(comment.strip())
+    if not match:
+        return None
+    text = match.group(1).strip()
+    return text if text else None
+
+
+def _program_has_fusion_toolpath(lines):
+    for raw_line in lines:
+        for comment in _extract_comments_from_line(raw_line):
+            if _parse_fusion_toolpath_comment(comment):
+                return True
+    return False
+
+
+def _line_has_fusion_toolpath_start(raw_line):
+    if not BLOCK_START_RE.match(raw_line):
+        return False
+    for comment in _extract_comments_from_line(raw_line):
+        if _parse_fusion_toolpath_comment(comment):
+            return True
+    return False
+
+
+def _fusion_toolpath_start_before(lines, idx, lookback=80):
+    start = max(0, idx - lookback)
+    for j in range(idx - 1, start - 1, -1):
+        if _line_has_fusion_toolpath_start(lines[j]):
+            return True
+    return False
+
+
+def _collect_fusion_section_comments(lines, start_idx, end_idx=None, max_forward=512):
+    """
+    Comments from a Fusion ``TOOLPATH :`` line through the section (may span many ``N####`` lines).
+    Stops at the next ``TOOLPATH :`` (section end), not at tool change — T#M6 may appear later.
+    """
+    comments = []
+    if end_idx is not None:
+        end = min(len(lines), end_idx)
+    else:
+        end = min(len(lines), start_idx + max_forward)
+    for j in range(start_idx, end):
+        if j > start_idx:
+            for comment in _extract_comments_from_line(lines[j]):
+                if _parse_fusion_toolpath_comment(comment):
+                    return comments
+        strip = lines[j].strip()
+        if not strip:
+            continue
+        for comment in _extract_comments_from_line(lines[j]):
+            c = comment.strip()
+            if c and not _is_fusion_separator_comment(c):
+                comments.append(c)
+    return comments
+
+
+def _fusion_inherit_active_tool(block_stats, fusion_active, tool_change_seen_in_block):
+    """Reuse last active tool/H when a TOOLPATH section has no new T#M6."""
+    if not fusion_active:
+        return
+    if not block_stats.get("tool_number") and fusion_active.get("tool_number"):
+        block_stats["tool_number"] = fusion_active["tool_number"]
+    if not block_stats.get("tool_description") and fusion_active.get("tool_description"):
+        block_stats["tool_description"] = fusion_active["tool_description"]
+        if fusion_active.get("tool_comment"):
+            block_stats["tool_comment"] = fusion_active["tool_comment"]
+    same_tool = (
+        block_stats.get("tool_number")
+        and block_stats["tool_number"] == fusion_active.get("tool_number")
+    )
+    if not block_stats["h_offsets"] and fusion_active.get("h_offsets"):
+        if not tool_change_seen_in_block or same_tool:
+            block_stats["h_offsets"] = set(fusion_active["h_offsets"])
+
+
+def _fusion_update_active_tool(fusion_active, block_stats, tool_change_seen_in_block):
+    """Persist tool#, description, and H for the next TOOLPATH section."""
+    if not fusion_active:
+        return
+    prev_tool = fusion_active.get("tool_number")
+    new_tool = block_stats.get("tool_number")
+    if block_stats.get("h_offsets"):
+        fusion_active["h_offsets"] = set(block_stats["h_offsets"])
+    elif tool_change_seen_in_block and new_tool and new_tool != prev_tool:
+        fusion_active["h_offsets"] = set()
+    if new_tool:
+        fusion_active["tool_number"] = new_tool
+    if block_stats.get("tool_description"):
+        fusion_active["tool_description"] = block_stats["tool_description"]
+        fusion_active["tool_comment"] = block_stats.get("tool_comment")
+
+
+def _apply_fusion_preamble_to_block(block_stats, comments_ordered):
+    tool_name_desc = None
+    tool_type_desc = None
+    for comment in comments_ordered:
+        if not comment or _is_fusion_separator_comment(comment):
+            continue
+        op = _parse_fusion_toolpath_comment(comment)
+        if op and not block_stats.get("operation_comment"):
+            block_stats["operation_comment"] = op
+            continue
+        if _is_fusion_metadata_comment(comment):
+            continue
+        name = _parse_fusion_tool_name(comment)
+        if name:
+            tool_name_desc = name
+            continue
+        typ = _parse_fusion_tool_type(comment)
+        if typ:
+            tool_type_desc = typ
+    desc = tool_name_desc or tool_type_desc
+    if desc:
+        cleaned = clean_tool_description(desc)
+        if cleaned and (_is_valid_tool_description(cleaned) or tool_name_desc):
+            block_stats["tool_description"] = cleaned
+            block_stats["tool_comment"] = desc
 
 
 def _is_ignored_comment(comment):
@@ -984,8 +1245,6 @@ def _merge_tool_info_into_block(block_stats, info):
         block_stats["diameter_from_comment"] = info["diameter"]
     if info.get("corner_radius"):
         block_stats["corner_radius_from_comment"] = info["corner_radius"]
-    if info.get("d_offset"):
-        block_stats["d_offsets"].add(info["d_offset"])
     if info.get("h_offset") and not block_stats["h_offsets"]:
         block_stats["h_offsets"].add(info["h_offset"])
 
@@ -1032,6 +1291,34 @@ def _clean_tool_description(comment):
     return clean_tool_description(c) or "-"
 
 
+def _parse_brother_tool_comment(comment):
+    """
+    Brother preamble tool line, e.g. ``(T1 3/8 BULL ENDMILL 0.03 RAD)``.
+    """
+    if not comment or _is_ignored_comment(comment) or _is_makino_metadata_comment(comment):
+        return None
+    c = comment.strip()
+    match = re.match(r"^T(\d+)\s+(.+)$", c, re.IGNORECASE)
+    if not match:
+        return None
+    tool_number = "T%d" % int(match.group(1))
+    desc = clean_tool_description(match.group(2).strip())
+    if not desc or not (_has_tool_word(desc) or _tool_comment_score(desc) >= 2):
+        return None
+    return {
+        "tool_number": tool_number,
+        "tool_description": desc,
+        "h_offset": None,
+        "d_offset": None,
+        "diameter": None,
+        "corner_radius": None,
+    }
+
+
+def _is_brother_tool_comment(comment):
+    return _parse_brother_tool_comment(comment) is not None
+
+
 def _parse_fanuc_paren_tool_comment(comment):
     """
   Fanuc/Mastercam parenthesis tool lines, e.g.
@@ -1053,7 +1340,6 @@ def _parse_fanuc_paren_tool_comment(comment):
         n = int(t_match.group(1))
         tool_number = "T%d" % n
         h_offset = "H%d" % n
-        d_offset = "D%d" % n
 
     dia_off_match = re.search(r"(\d+)\s+DIA\.?\s*OFF", c, re.IGNORECASE)
     if dia_off_match:
@@ -1064,6 +1350,14 @@ def _parse_fanuc_paren_tool_comment(comment):
             h_offset = "H%d" % n
         if not d_offset:
             d_offset = "D%d" % n
+    else:
+        dia_off_trailing = re.search(
+            r"DIA\.?\s*OFF\.?\s*[-–—]?\s*(\d+)", c, re.IGNORECASE
+        )
+        if dia_off_trailing:
+            n = int(dia_off_trailing.group(1))
+            if not d_offset:
+                d_offset = "D%d" % n
 
     tool_dia_match = re.search(r"TOOL\s+DIA\.?\s*[-–—]?\s*([0-9.]+)", c, re.IGNORECASE)
     if tool_dia_match:
@@ -1104,6 +1398,10 @@ def _extract_tool_info_from_comment(comment):
             "diameter": siemens.get("diameter"),
             "corner_radius": siemens.get("corner_radius"),
         }
+
+    brother = _parse_brother_tool_comment(comment)
+    if brother:
+        return brother
 
     mastercam = _parse_mastercam_inline_tool_comment(comment)
     if mastercam:
@@ -1205,10 +1503,12 @@ def _collect_pre_operation_comments(lines, start_idx, max_lookback=20):
             continue
 
         clean = _clean_line(lines[j])
-        if TOOL_RE.search(clean) or M6_RE.search(clean):
+        if _is_coolant_only_line(clean):
             j -= 1
             steps += 1
             continue
+        if _is_tool_change_boundary_line(clean, j, start_idx):
+            break
 
         break
 
@@ -1226,12 +1526,14 @@ def _apply_inline_tool_comments_to_block(block_stats, comments):
 
 def _pick_operation_comment(comments_ordered, block_number=None):
     """
-    First useful preamble comment (Makino: title line before ``N#### T#`` / ``M06``).
+    First useful preamble comment (Makino/Brother: title line before ``N####`` / tool change).
     """
     for comment in comments_ordered:
         if not comment or _is_ignored_comment(comment) or _is_makino_metadata_comment(comment):
             continue
-        if _is_tool_comment(comment):
+        if _is_fusion_metadata_comment(comment) or _parse_fusion_toolpath_comment(comment):
+            continue
+        if _is_brother_tool_comment(comment) or _is_tool_comment(comment):
             continue
         cleaned = clean_operation_comment(comment, block_number)
         if cleaned:
@@ -1295,6 +1597,18 @@ def _collect_following_preamble_comments(lines, start_idx, max_forward=32):
     return comments
 
 
+def _n_block_has_pre_operation_signals(lines, n_idx, lookback=24):
+    """Brother/Makino: ``N####`` with useful parenthesis comments above the block."""
+    for comment in _collect_pre_operation_comments(lines, n_idx, max_lookback=lookback):
+        if not comment or _is_ignored_comment(comment) or _is_makino_metadata_comment(comment):
+            continue
+        if _is_brother_tool_comment(comment) or _is_tool_comment(comment):
+            return True
+        if clean_operation_comment(comment):
+            return True
+    return False
+
+
 def _n_block_has_operation_signals(lines, n_idx, forward_limit=25):
     """
     After ``N####``, detect MPF/Fanuc operation signals before the next N block:
@@ -1350,20 +1664,37 @@ def _standalone_tool_change_covered_by_n_block(lines, idx, lookback=30):
     return False
 
 
-def _is_operation_start(lines, idx):
+def _is_operation_start(lines, idx, fusion_mode=False):
     raw_line = lines[idx]
     clean_line = _clean_line(raw_line)
 
     if BLOCK_START_RE.match(raw_line):
-        if _is_superseded_small_n_block(lines, idx):
+        if _is_superseded_small_n_block(lines, idx) and not (
+            fusion_mode and _line_has_fusion_toolpath_start(raw_line)
+        ):
             return False
-        if TOOL_RE.search(clean_line) or M6_RE.search(clean_line):
+        if fusion_mode:
+            return _line_has_fusion_toolpath_start(raw_line)
+        if (
+            TOOL_RE.search(clean_line)
+            or M6_RE.search(clean_line)
+            or _tool_number_from_tool_change_line(clean_line)
+        ):
             return True
         if _tool_number_from_g100_line(clean_line):
             return True
         if COMMENT_RE.search(raw_line) or _extract_semicolon_comment(raw_line):
             return True
+        if _n_block_has_pre_operation_signals(lines, idx):
+            return True
         return _n_block_has_operation_signals(lines, idx)
+
+    if _is_m6_tool_change_line(clean_line):
+        if fusion_mode and _fusion_toolpath_start_before(lines, idx):
+            return False
+        if _standalone_tool_change_covered_by_n_block(lines, idx):
+            return False
+        return True
 
     if _tool_number_from_clean_line(clean_line):
         if _standalone_tool_change_covered_by_n_block(lines, idx):
@@ -1380,8 +1711,15 @@ def _is_operation_start(lines, idx):
 def _parse_operation_blocks(lines, header_tool_map):
     operation_blocks = []
     operation_start_indexes = []
+    fusion_mode = _program_has_fusion_toolpath(lines)
+    fusion_active = {
+        "tool_number": None,
+        "tool_description": None,
+        "tool_comment": None,
+        "h_offsets": None,
+    }
     for idx in range(len(lines)):
-        if _is_operation_start(lines, idx):
+        if _is_operation_start(lines, idx, fusion_mode=fusion_mode):
             operation_start_indexes.append(idx)
     if not operation_start_indexes:
         return operation_blocks
@@ -1390,35 +1728,40 @@ def _parse_operation_blocks(lines, header_tool_map):
         end_idx = operation_start_indexes[k + 1] if k + 1 < len(operation_start_indexes) else len(lines)
         block_line_raw = lines[start_idx].strip()
         block_match = BLOCK_START_RE.match(lines[start_idx])
-        block_number = block_match.group(1).upper() if block_match else "-"
-        block_stats = _new_block_stats(block_number, block_line_raw)
+        block_number = block_match.group(1).upper() if block_match else ""
+        block_stats = _new_block_stats(block_number or "-", block_line_raw)
 
         inline_tool_change_line = _line_has_inline_tool_change(lines[start_idx])
         start_line_comments = list(_extract_comments_from_line(lines[start_idx]))
 
+        fusion_toolpath_start = fusion_mode and _line_has_fusion_toolpath_start(lines[start_idx])
         preamble = []
-        if BLOCK_START_RE.match(lines[start_idx]):
-            for comment in _collect_pre_operation_comments(lines, start_idx):
-                if comment not in preamble:
-                    preamble.append(comment)
-            for comment in _collect_following_preamble_comments(lines, start_idx):
-                if inline_tool_change_line and comment in start_line_comments:
-                    continue
-                if comment not in preamble:
-                    preamble.append(comment)
+        if fusion_toolpath_start:
+            preamble = _collect_fusion_section_comments(lines, start_idx, end_idx)
+            _apply_fusion_preamble_to_block(block_stats, preamble)
         else:
-            preamble = _collect_pre_operation_comments(lines, start_idx)
-        if not inline_tool_change_line:
-            for comment in start_line_comments:
-                if comment not in preamble:
-                    preamble.append(comment)
+            if BLOCK_START_RE.match(lines[start_idx]):
+                for comment in _collect_pre_operation_comments(lines, start_idx):
+                    if comment not in preamble:
+                        preamble.append(comment)
+                for comment in _collect_following_preamble_comments(lines, start_idx):
+                    if inline_tool_change_line and comment in start_line_comments:
+                        continue
+                    if comment not in preamble:
+                        preamble.append(comment)
+            else:
+                preamble = _collect_pre_operation_comments(lines, start_idx)
+            if not inline_tool_change_line:
+                for comment in start_line_comments:
+                    if comment not in preamble:
+                        preamble.append(comment)
 
-        n_line_op = _extract_operation_comment_from_n_line(lines[start_idx], block_number)
-        if n_line_op:
-            block_stats["operation_comment"] = n_line_op
-        _apply_preamble_comments_to_block(block_stats, preamble)
-        if inline_tool_change_line:
-            _apply_inline_tool_comments_to_block(block_stats, start_line_comments)
+            n_line_op = _extract_operation_comment_from_n_line(lines[start_idx], block_number)
+            if n_line_op:
+                block_stats["operation_comment"] = n_line_op
+            _apply_preamble_comments_to_block(block_stats, preamble)
+            if inline_tool_change_line:
+                _apply_inline_tool_comments_to_block(block_stats, start_line_comments)
 
         tool_change_seen_in_block = False
         for line_idx in range(start_idx, end_idx):
@@ -1462,6 +1805,12 @@ def _parse_operation_blocks(lines, header_tool_map):
             for axis, axis_value in AXIS_RE.findall(clean_line):
                 _update_axis(block_stats, axis, float(axis_value))
 
+        if not block_stats["tool_number"] and block_stats.get("tool_comment"):
+            from_comment = _tool_number_from_tool_comment(block_stats["tool_comment"])
+            if from_comment:
+                block_stats["tool_number"] = from_comment
+        _apply_d_offset_fallback_from_tool_comment(block_stats)
+
         if block_stats.get("operation_comment"):
             block_stats["operation_comment"] = clean_operation_comment(
                 block_stats["operation_comment"], block_number
@@ -1479,6 +1828,14 @@ def _parse_operation_blocks(lines, header_tool_map):
         if block_stats.get("tool_comment"):
             block_stats["tool_comment"] = clean_tool_description(block_stats["tool_comment"])
 
+        if fusion_toolpath_start:
+            _fusion_inherit_active_tool(
+                block_stats, fusion_active, tool_change_seen_in_block
+            )
+            _fusion_update_active_tool(
+                fusion_active, block_stats, tool_change_seen_in_block
+            )
+
         header_tool = header_tool_map.get(block_stats["tool_number"], {})
         block_stats["tool_description_from_header"] = header_tool.get("tool_description", "-")
         block_stats["h_offset_from_header"] = header_tool.get("h_offset", "-")
@@ -1486,7 +1843,10 @@ def _parse_operation_blocks(lines, header_tool_map):
 
         operation_blocks.append(
             {
-                "block_number": block_stats["block_number"],
+                "sequence_index": k,
+                "block_number": block_stats["block_number"]
+                if block_stats["block_number"] not in ("-", "")
+                else "-",
                 "block_line": block_stats["block_line"],
                 "tool_number": block_stats["tool_number"] or "-",
                 "operation_comment": _format_comment(block_stats["operation_comment"]),
