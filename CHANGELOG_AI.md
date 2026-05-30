@@ -44,6 +44,71 @@ Briefly describe what the user asked for.
 
 ---
 
+## 2026-05-30 — O3618 Macro/Tool-Counter Regression Test Coverage
+
+### Task
+Strengthen `run_parser_tests.py` so the O3618 macro/tool-counter Fanuc milling fix is permanently guarded against regression.
+
+### Files Changed
+- `run_parser_tests.py`
+- `parser_tests/fanuc_macro_preamble/o3618_macro_tool_counter.expected.json`
+- `parser_tests/fanuc_macro_preamble/o3618_macro_tool_counter.txt`
+- `CHANGELOG_AI.md`
+
+### What Changed
+- Fixture `source` field (same convention as `program_type` tests) loads `samples/O3618.txt` for operation-block tests.
+- Optional regression guards: `forbidden_tool_numbers`, `forbidden_block_numbers`, `forbidden_tool_placeholder`, `require_min_operation_blocks`.
+- Optional `tool_description_contains` per block for substring checks.
+- O3618 fixture now asserts 4 rows (T9–T12), macro N-blocks absent, post-M30 T5/T6 absent, no placeholder `-` tool row.
+
+### What Was Not Changed
+- Parser logic unchanged.
+- UI and setup sheet layout unchanged.
+
+### Test Notes
+- `python run_parser_tests.py` — 26 passed
+
+### Follow-Up
+- None.
+
+---
+
+## 2026-05-30 — Fanuc O3618 Macro/Tool-Counter Milling Parser
+
+### Task
+Fix Fanuc/Haas milling operation extraction for O3618-style programs with macro/tool-counter preamble before real `T#M6` tool changes. Stop at first `M30`; do not parse post-M30 optional sections.
+
+### Files Changed
+- `gcode_parser.py`
+- `parser_tests/fanuc_macro_preamble/o3618_macro_tool_counter.txt`
+- `parser_tests/fanuc_macro_preamble/o3618_macro_tool_counter.expected.json`
+- `CHANGELOG_AI.md`
+
+### What Changed
+- Dense N-block mode now requires at least one `N#### T# M6` on the same line (programs with only standalone `T#M6` are not dense).
+- Skip Fanuc macro return labels `N5000`–`N5999` without inline tool text as operation starts.
+- Truncate operation parsing before the first real `M30` line.
+- Classify short op labels (`drill`, `drill2`) as operation comments, not tool descriptions.
+- Extract tool description from `N###(tool text)` block-start lines.
+- Keep only the first `G54P#` datum per operation block when multiple fixture offsets rotate in one section.
+- Drop operation blocks with no resolved tool number (no blank fallback row when real tools exist).
+- Ignore TOOL COUNTER / CHANGE T / TURN ON/OFF comment terms.
+- Added regression fixture for macro-preamble Fanuc 3-axis sample.
+
+### What Was Not Changed
+- UI and setup sheet layout unchanged.
+- Lathe, Siemens/DMG, HEIDENHAIN, Brother, Makino, Fusion parsers unchanged except shared work-offset rule for repeated `G54P#` only.
+- Program type detection unchanged.
+
+### Test Notes
+- Sample: `samples/O3618.txt` — 4 rows T9–T12, N109/N210/N311/N412, drill/drill2 comments, G54P1, H9–H12
+- Regression: `python run_parser_tests.py` — 26 passed
+
+### Follow-Up
+- Post-M30 optional sections (T5/T6 after `M30`) not parsed unless requested later.
+
+---
+
 ## 2026-05-29 — Streamlit Cloud ImportError Fix (home.py)
 
 ### Task

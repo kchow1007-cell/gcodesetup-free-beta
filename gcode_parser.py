@@ -678,6 +678,11 @@ _IGNORED_COMMENT_TERMS = (
     "C-AXIS LOCK",
     "B-AXIS UNLOCK",
     "B-AXIS LOCK",
+    "TOOL COUNTER",
+    "BACKUP TOOL COUNTER",
+    "CHANGE T",
+    "TURN ON",
+    "TURN OFF",
 )
 
 # Makino / ProNC preamble lines — never operation or tool description.
@@ -1089,6 +1094,8 @@ def _operation_comment_score(comment):
 
 
 def _is_tool_comment(comment):
+    if _is_fanuc_short_operation_label(comment):
+        return False
     if _is_cam_process_comment(comment):
         return False
     if _parse_semicolon_tool_comment(comment) or _parse_mastercam_inline_tool_comment(comment):
@@ -1103,6 +1110,8 @@ def _is_tool_comment(comment):
 
 
 def _is_operation_comment(comment):
+    if _is_fanuc_short_operation_label(comment):
+        return True
     op_score = _operation_comment_score(comment)
     if op_score <= 0:
         return False
@@ -1683,9 +1692,80 @@ def _n_line_has_fanuc_tool_change(clean_line: str) -> bool:
     )
 
 
+def _is_fanuc_short_operation_label(comment):
+    """
+    Short standalone op labels (``drill``, ``drill2``) before an N-block tool line.
+    Not tool descriptions — avoid matching the DRILL tool-word pattern alone.
+    """
+    if not comment:
+        return False
+    c = comment.strip()
+    if len(c) > 24:
+        return False
+    if re.search(r"[/\\]|MM\b|DIA\b|FLUTE|ENDMILL|#\d|\.[0-9]", c, re.IGNORECASE):
+        return False
+    return bool(re.fullmatch(r"[a-z][a-z0-9_]*", c, re.IGNORECASE))
+
+
+def _is_fanuc_macro_n_block_line(raw_line):
+    """
+    Fanuc macro/tool-counter return labels (``N5001``–``N5999``) without inline tool text.
+  Real op headers like ``N109(1.5 MM BALL MILL)`` are not macro blocks.
+    """
+    block_match = BLOCK_START_RE.match(raw_line)
+    if not block_match:
+        return False
+    n_val = _n_block_numeric(block_match.group(1))
+    if n_val is None or n_val < 5000 or n_val >= 6000:
+        return False
+    for comment in _extract_comments_from_line(raw_line):
+        c = comment.strip()
+        if not c or _is_ignored_comment(c) or _is_fanuc_short_operation_label(c):
+            continue
+        if _tool_comment_score(c) >= 3 or re.search(
+            r"MM\b|DIA\b|FLUTE|ENDMILL|BALL\s+MILL|CHAMFER", c, re.IGNORECASE
+        ):
+            return False
+    return True
+
+
+def _truncate_lines_before_first_m30(lines):
+    """Stop parsing at the first real ``M30`` program end (exclude post-M30 optional sections)."""
+    for i, raw in enumerate(lines):
+        clean = _clean_line(raw).strip().upper()
+        if clean == "M30":
+            return lines[:i]
+    return lines
+
+
+def _apply_n_block_inline_tool_description(block_stats, raw_line):
+    """Tool description from ``N109(1.5 MM 2 FLUTE BALL MILL)`` on the block start line."""
+    if not BLOCK_START_RE.match(raw_line) or _line_has_inline_tool_change(raw_line):
+        return
+    block_number = block_stats.get("block_number")
+    for comment in _extract_comments_from_line(raw_line):
+        if _is_ignored_comment(comment) or _is_fanuc_short_operation_label(comment):
+            continue
+        cleaned = _strip_block_number_from_comment(comment, block_number)
+        if not cleaned:
+            continue
+        if _is_fanuc_short_operation_label(cleaned):
+            continue
+        if _operation_comment_score(cleaned) > _tool_comment_score(cleaned) and not _has_tool_word(
+            cleaned
+        ):
+            continue
+        desc = _sanitize_tool_description(_clean_tool_description(cleaned))
+        if desc:
+            block_stats["tool_description"] = desc
+            block_stats["tool_comment"] = cleaned
+            return
+
+
 def _program_has_dense_n_blocks(lines: list[str]) -> bool:
     """
     Haas/Fanuc programs with N on nearly every line but few N-line tool changes.
+    Requires at least one ``N#### T# M6`` on the same line (not standalone ``T#M6`` only).
     """
     n_count = 0
     tool_change_n = 0
@@ -1695,7 +1775,11 @@ def _program_has_dense_n_blocks(lines: list[str]) -> bool:
         n_count += 1
         if _n_line_has_fanuc_tool_change(_clean_line(raw)):
             tool_change_n += 1
-    return n_count >= 8 and tool_change_n <= max(1, n_count // 4)
+    return (
+        n_count >= 8
+        and tool_change_n >= 1
+        and tool_change_n <= max(1, n_count // 4)
+    )
 
 
 def _is_operation_start(lines, idx, fusion_mode=False, dense_n_fanuc=False):
@@ -1703,6 +1787,8 @@ def _is_operation_start(lines, idx, fusion_mode=False, dense_n_fanuc=False):
     clean_line = _clean_line(raw_line)
 
     if BLOCK_START_RE.match(raw_line):
+        if _is_fanuc_macro_n_block_line(raw_line):
+            return False
         if _is_superseded_small_n_block(lines, idx) and not (
             fusion_mode and _line_has_fusion_toolpath_start(raw_line)
         ):
@@ -1749,6 +1835,7 @@ def _is_operation_start(lines, idx, fusion_mode=False, dense_n_fanuc=False):
 
 
 def _parse_operation_blocks(lines, header_tool_map):
+    lines = _truncate_lines_before_first_m30(lines)
     operation_blocks = []
     operation_start_indexes = []
     fusion_mode = _program_has_fusion_toolpath(lines)
@@ -1802,6 +1889,7 @@ def _parse_operation_blocks(lines, header_tool_map):
             n_line_op = _extract_operation_comment_from_n_line(lines[start_idx], block_number)
             if n_line_op:
                 block_stats["operation_comment"] = n_line_op
+            _apply_n_block_inline_tool_description(block_stats, lines[start_idx])
             _apply_preamble_comments_to_block(block_stats, preamble)
             if inline_tool_change_line:
                 _apply_inline_tool_comments_to_block(block_stats, start_line_comments)
@@ -1843,7 +1931,18 @@ def _parse_operation_blocks(lines, header_tool_map):
                 block_stats["coolant_states"].add("M" + coolant)
             for cycle in CANNED_CYCLE_RE.findall(clean_line):
                 block_stats["canned_cycles"].add("G" + cycle)
-            block_stats["work_offsets"].update(_collect_work_offsets(clean_line))
+            new_offsets = _collect_work_offsets(clean_line)
+            if new_offsets:
+                if not block_stats["work_offsets"]:
+                    block_stats["work_offsets"].update(new_offsets)
+                else:
+                    existing = block_stats["work_offsets"]
+                    if all(re.match(r"^G54P\d+$", o, re.IGNORECASE) for o in existing) and all(
+                        re.match(r"^G54P\d+$", o, re.IGNORECASE) for o in new_offsets
+                    ):
+                        pass
+                    else:
+                        block_stats["work_offsets"].update(new_offsets)
 
             for axis, axis_value in AXIS_RE.findall(clean_line):
                 _update_axis(block_stats, axis, float(axis_value))
@@ -1884,9 +1983,12 @@ def _parse_operation_blocks(lines, header_tool_map):
         block_stats["h_offset_from_header"] = header_tool.get("h_offset", "-")
         block_stats["d_offset_from_header"] = header_tool.get("d_offset_register", "-")
 
+        if not block_stats["tool_number"]:
+            continue
+
         operation_blocks.append(
             {
-                "sequence_index": k,
+                "sequence_index": len(operation_blocks),
                 "block_number": block_stats["block_number"]
                 if block_stats["block_number"] not in ("-", "")
                 else "-",
