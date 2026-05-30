@@ -18,10 +18,6 @@ from app_shared import (
 )
 from feedback_form import render_parser_feedback_form
 from gcode_parser import (
-    MILLING_TYPE_3_AXIS,
-    MILLING_TYPE_4_AXIS,
-    MILLING_TYPE_5_AXIS,
-    MILLING_TYPE_UNKNOWN,
     PROGRAM_TYPE_LATHE,
     PROGRAM_TYPE_MILL_TURN,
     PROGRAM_TYPE_MILLING,
@@ -66,10 +62,10 @@ _PROGRAM_TYPE_SELECT_OPTIONS = [
 ]
 
 _MANUAL_PROGRAM_TYPE_MAP = {
-    "Milling — 3-Axis": (PROGRAM_TYPE_MILLING, MILLING_TYPE_3_AXIS),
-    "Milling — 4-Axis": (PROGRAM_TYPE_MILLING, MILLING_TYPE_4_AXIS),
-    "Milling — 5-Axis": (PROGRAM_TYPE_MILLING, MILLING_TYPE_5_AXIS),
-    "Milling — Unknown": (PROGRAM_TYPE_MILLING, MILLING_TYPE_UNKNOWN),
+    "Milling — 3-Axis": (PROGRAM_TYPE_MILLING, "3-Axis Milling"),
+    "Milling — 4-Axis": (PROGRAM_TYPE_MILLING, "4-Axis Milling"),
+    "Milling — 5-Axis": (PROGRAM_TYPE_MILLING, "5-Axis Milling"),
+    "Milling — Unknown": (PROGRAM_TYPE_MILLING, "Unknown Milling"),
     "Lathe / Turning": (PROGRAM_TYPE_LATHE, None),
     "Mill-Turn": (PROGRAM_TYPE_MILL_TURN, None),
     "Swiss": (PROGRAM_TYPE_SWISS, None),
