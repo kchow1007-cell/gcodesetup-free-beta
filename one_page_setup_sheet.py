@@ -524,9 +524,9 @@ def build_one_page_html(
 
     def _hv(lbl: str, val: str) -> str:
         return (
-            f'<td style="border:1px solid #000;padding:2px 5px;background:#f0f0f0;{_FONT_LABEL}'
-            f'white-space:nowrap;width:1%;">{_esc(lbl)}</td>'
-            f'<td style="border:1px solid #000;padding:2px 5px;{_FONT_BODY}">{_esc(val)}</td>'
+            f'<td class="header-label-cell" style="border:1px solid #000;padding:2px 5px;background:#f0f0f0;{_FONT_LABEL}">'
+            f'{_esc(lbl)}</td>'
+            f'<td class="header-value-cell" style="border:1px solid #000;padding:2px 5px;{_FONT_BODY}">{_esc(val)}</td>'
         )
 
     top_right_rows = "".join(
@@ -609,18 +609,42 @@ def build_one_page_html(
         operation_table_html = ""
 
     op_style = """<style type="text/css">
-.setup-sheet-page { font-family: Arial, Helvetica, sans-serif; background: #fff; color: #000; }
+.setup-sheet-page,
+.setup-sheet {
+  font-family: Arial, Helvetica, sans-serif;
+  background: #fff;
+  color: #000;
+  width: 100%;
+  max-width: none;
+  transform: none;
+  box-sizing: border-box;
+}
 .setup-sheet-page td,
 .setup-sheet-page th {
-  white-space: normal;
-  word-break: break-word;
-  overflow-wrap: anywhere;
   vertical-align: top;
   box-sizing: border-box;
 }
 .header-table { width: 100%; table-layout: fixed; border-collapse: collapse; }
+.header-fields-table { width: 100%; table-layout: fixed; border-collapse: collapse; }
+.header-label-cell {
+  white-space: nowrap;
+  word-break: normal;
+  overflow-wrap: normal;
+  writing-mode: horizontal-tb;
+  text-orientation: mixed;
+  width: 13%;
+  min-width: 4.5em;
+  vertical-align: middle;
+}
+.header-value-cell {
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: break-word;
+  width: 37%;
+  vertical-align: middle;
+}
 .logo-cell {
-  width: 150px; min-width: 150px; max-width: 150px; height: 85px; padding: 4px;
+  width: 20%; min-width: 110px; max-width: 22%; height: 85px; padding: 4px;
   box-sizing: border-box; vertical-align: middle; text-align: center;
   border: 1px solid #000; overflow: hidden;
 }
@@ -676,7 +700,7 @@ def build_one_page_html(
   white-space: normal; }
 .op-sheet-table td { font-size: 9px; border: 1px solid #000; padding: 2px 4px;
   min-height: 16px; height: auto; box-sizing: border-box;
-  overflow: visible; white-space: normal; word-break: break-word; overflow-wrap: anywhere; }
+  overflow: visible; white-space: normal; word-break: break-word; overflow-wrap: break-word; }
 .op-sheet-table .center-col {
   text-align: center;
   vertical-align: middle;
@@ -694,15 +718,39 @@ def build_one_page_html(
   text-align: center; border-top: 1px solid #ccc;
 }
 @media print {
-  @page { size: letter portrait; margin: 0.25in; }
-  body { margin: 0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-  .setup-sheet-page { width: 100%; max-width: none; box-shadow: none; border: none; padding: 0; }
+  @page { size: A4 portrait; margin: 8mm; }
+  body { margin: 0; font-size: 9px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .setup-sheet-page,
+  .setup-sheet {
+    width: 100% !important;
+    max-width: none !important;
+    transform: none !important;
+    box-shadow: none;
+    border: none;
+    padding: 0;
+    font-size: 9px;
+  }
   .no-print { display: none !important; }
-  .setup-sheet-page td,
-  .setup-sheet-page th {
+  .header-table { table-layout: fixed !important; width: 100% !important; }
+  .header-fields-table { table-layout: fixed !important; width: 100% !important; }
+  .header-label-cell {
+    white-space: nowrap !important;
+    word-break: normal !important;
+    overflow-wrap: normal !important;
+    writing-mode: horizontal-tb !important;
+    text-orientation: mixed !important;
+    width: 13% !important;
+    min-width: 4.5em !important;
+    font-size: 8px !important;
     overflow: visible !important;
+  }
+  .header-value-cell {
     white-space: normal !important;
     word-break: break-word !important;
+    overflow-wrap: break-word !important;
+    width: 37% !important;
+    font-size: 9px !important;
+    overflow: visible !important;
   }
   .datum-value,
   .setup-notes-value,
@@ -711,24 +759,33 @@ def build_one_page_html(
     min-height: auto;
     overflow: visible !important;
     white-space: pre-line !important;
+    font-size: 9px !important;
   }
   .logo-cell {
-    width: 150px !important; min-width: 150px !important; max-width: 150px !important;
-    height: 85px !important;
+    width: 20% !important;
+    min-width: 0 !important;
+    max-width: 22% !important;
+    height: 72px !important;
   }
   .logo-box {
     width: 100% !important; height: 100% !important; overflow: hidden !important;
   }
   .logo-text-screen { display: none !important; }
   .logo-text-print { display: inline !important; }
+  .sheet-section-title { font-size: 9px !important; }
+  .sheet-section-body { font-size: 9px !important; }
   .operation-table-wrap { break-inside: auto; page-break-inside: auto; }
   .operation-table { break-inside: auto; page-break-inside: auto; }
   .operation-table thead { display: table-header-group; }
   .operation-table tbody tr { break-inside: avoid; page-break-inside: avoid; }
+  .op-sheet-table th { font-size: 8px !important; }
   .op-sheet-table td {
     height: auto !important;
     overflow: visible !important;
     white-space: normal !important;
+    word-break: break-word !important;
+    overflow-wrap: break-word !important;
+    font-size: 8px !important;
   }
   .op-sheet-table .center-col {
     text-align: center !important;
@@ -750,7 +807,7 @@ def build_one_page_html(
 <tr>
 <td class="logo-cell">{logo_html}</td>
 <td style="vertical-align:top;border:1px solid #000;padding:0;">
-<table style="width:100%;border-collapse:collapse;">{top_right_rows}</table>
+<table class="header-fields-table" style="width:100%;border-collapse:collapse;">{top_right_rows}</table>
 </td>
 </tr>
 </table>

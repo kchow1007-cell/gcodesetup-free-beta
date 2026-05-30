@@ -44,6 +44,38 @@ Briefly describe what the user asked for.
 
 ---
 
+## 2026-05-30 — Setup Sheet Browser Print Preview Header Layout
+
+### Task
+Fix setup sheet browser print preview so the header matches the web preview (horizontal labels, no vertical one-letter stacking).
+
+### Files Changed
+- `one_page_setup_sheet.py`
+- `CHANGELOG_AI.md`
+
+### What Changed
+- Added `header-label-cell` / `header-value-cell` classes and `header-fields-table` for the top header grid.
+- Removed global `overflow-wrap: anywhere` and blanket print overrides that forced `white-space: normal` on all cells (this was overriding label `nowrap`).
+- Scoped aggressive word-wrap to operation table cells only; header labels use `nowrap`, normal word-break, and horizontal writing mode in print.
+- Logo column uses ~20% width in print instead of fixed 150px; header label/value columns use fixed table-layout percentages.
+- Print page: A4 portrait, 8mm margin; slight print font sizes (8–9px) without over-shrinking.
+
+### What Was Not Changed
+- Parser logic unchanged.
+- Detection logic unchanged.
+- Operation row logic unchanged.
+- Setup sheet data fields unchanged.
+- App navigation unchanged.
+
+### Test Notes
+- Open setup sheet in web preview; use browser Print Preview (Ctrl+P).
+- Expected: PART#, CUSTOMER, OPERATION#, PROGRAM#, PART DESCRIPTION, MATERIAL, STOCK SIZE, CREATED BY read horizontally; logo left; machine/fixture/datum and operation table readable on portrait A4/letter.
+
+### Follow-Up
+- None.
+
+---
+
 ## 2026-05-30 — O3618 Macro/Tool-Counter Regression Test Coverage
 
 ### Task
