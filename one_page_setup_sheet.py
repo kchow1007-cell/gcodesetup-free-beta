@@ -1,6 +1,6 @@
 """
 One-page shop-floor setup sheet HTML (deterministic, no AI).
-Excel-style borders; grey / light blue operation section headers.
+Excel-style borders; single combined operation table for preview/print.
 """
 import html
 import re
@@ -186,18 +186,32 @@ def format_operation_row_label(position: int, row: Any) -> str:
     return f"{position + 1} - {datum} - {tool_disp} - {block_disp}"
 
 
-def insert_blank_row_below(df: pd.DataFrame, position: int) -> pd.DataFrame:
-    """Insert one blank row directly below ``position`` (0-based), copying Datum."""
+def _insert_blank_row_relative(df: pd.DataFrame, position: int, *, above: bool) -> pd.DataFrame:
+    """Insert one blank row above or below ``position`` (0-based); Datum copied from selected row."""
     out = strip_editor_ui_columns(df)
     if out.empty:
         return pd.DataFrame([blank_operation_row("G54")])
     pos = max(0, min(int(position), len(out) - 1))
     datum = normalize_datum_label(out.iloc[pos].get("Datum", "G54")) or "G54"
     new_row = blank_operation_row(datum)
-    top = out.iloc[: pos + 1]
-    bottom = out.iloc[pos + 1 :]
+    if above:
+        top = out.iloc[:pos]
+        bottom = out.iloc[pos:]
+    else:
+        top = out.iloc[: pos + 1]
+        bottom = out.iloc[pos + 1 :]
     merged = pd.concat([top, pd.DataFrame([new_row]), bottom], ignore_index=True)
     return merged.reset_index(drop=True)
+
+
+def insert_blank_row_above(df: pd.DataFrame, position: int) -> pd.DataFrame:
+    """Insert one blank row directly above ``position`` (0-based), copying Datum."""
+    return _insert_blank_row_relative(df, position, above=True)
+
+
+def insert_blank_row_below(df: pd.DataFrame, position: int) -> pd.DataFrame:
+    """Insert one blank row directly below ``position`` (0-based), copying Datum."""
+    return _insert_blank_row_relative(df, position, above=False)
 
 
 def clear_operation_column(df: pd.DataFrame, column: str) -> pd.DataFrame:
@@ -356,7 +370,7 @@ def default_operation_editor_rows(
                     "Tool Description": tdesc,
                     "H offsets": ob.get("h_offset") or "-",
                     "D offsets": d_col,
-                    "Remark": "",
+                    "Remark": ob.get("remark") or "",
                 }
             )
 
@@ -407,10 +421,43 @@ def default_metadata(result=None, setup_sheet=None) -> Dict[str, str]:
 
 _OP_TABLE_COLGROUP = (
     "<colgroup>"
-    '<col style="width:6%" /><col style="width:7%" /><col style="width:43%" />'
-    '<col style="width:26%" /><col style="width:7%" /><col style="width:7%" /><col style="width:10%" />'
+    '<col style="width:6%" /><col style="width:8%" /><col style="width:28%" />'
+    '<col style="width:8%" /><col style="width:22%" /><col style="width:7%" />'
+    '<col style="width:7%" /><col style="width:14%" />'
     "</colgroup>"
 )
+
+_OP_TABLE_HEADERS = (
+    "Tool#",
+    "N sequence #",
+    "Operation description",
+    "Datum",
+    "Tool Description",
+    "H offsets",
+    "D offsets",
+    "Remark",
+)
+# Per-column alignment for preview/print (indices match _OP_TABLE_HEADERS).
+_OP_COL_ALIGN = (
+    "center-col",
+    "center-col",
+    "left-col",
+    "center-col",
+    "left-col",
+    "center-col",
+    "center-col",
+    "left-col",
+)
+
+
+def _preview_rows_in_program_order(df: pd.DataFrame) -> pd.DataFrame:
+    """Non-empty rows in editor sequence (no datum grouping or auto-sort)."""
+    out = filter_empty_operation_rows(df)
+    if out.empty:
+        return out
+    if "sequence_index" in out.columns:
+        out = out.sort_values(by="sequence_index", kind="stable")
+    return out.reset_index(drop=True)
 
 
 def group_editor_rows_by_datum(
@@ -460,11 +507,8 @@ def build_one_page_html(
     prepared_by, approved_by.
     """
     allowed_logo_mimes = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"}
-    preview_df = filter_empty_operation_rows(op_df)
-    grouped = group_editor_rows_by_datum(
-        preview_df,
-        preserve_order=preserve_operation_order,
-    )
+    del preserve_operation_order  # preview always follows editor row order
+    preview_df = _preview_rows_in_program_order(op_df)
 
     if logo_b64 and logo_mime:
         safe_mime = logo_mime if logo_mime in allowed_logo_mimes else "image/png"
@@ -517,47 +561,52 @@ def build_one_page_html(
             return ""
         return _esc(val)
 
-    op_sections_html = []
-    for datum_label, sub in grouped:
-        if sub is None or sub.empty:
-            continue
-        title = _esc(normalize_datum_label(datum_label))
-
-        body_rows = []
-        for _, r in sub.iterrows():
-            rem = r.get("Remark")
-            if rem is None or (isinstance(rem, float) and pd.isna(rem)):
-                rem = ""
-            body_rows.append(
-                "<tr>"
-                f"<td>{_cell(r.get('Tool#'))}</td>"
-                f"<td>{_cell(r.get('Block#'))}</td>"
-                f"<td>{_cell(r.get('Operation Comment'))}</td>"
-                f"<td>{_cell(r.get('Tool Description'))}</td>"
-                f"<td>{_cell(r.get('H offsets'))}</td>"
-                f"<td>{_cell(r.get('D offsets'))}</td>"
-                f"<td>{_cell(rem)}</td>"
-                "</tr>"
+    body_rows = []
+    for _, r in preview_df.iterrows():
+        rem = r.get("Remark")
+        if rem is None or (isinstance(rem, float) and pd.isna(rem)):
+            rem = ""
+        datum_val = r.get("Datum")
+        if datum_val is not None and not (isinstance(datum_val, float) and pd.isna(datum_val)):
+            datum_disp = str(datum_val).strip()
+        else:
+            datum_disp = ""
+        row_vals = (
+            _cell(r.get("Tool#")),
+            _cell(r.get("Block#")),
+            _cell(r.get("Operation Comment")),
+            _esc(datum_disp),
+            _cell(r.get("Tool Description")),
+            _cell(r.get("H offsets")),
+            _cell(r.get("D offsets")),
+            _cell(rem),
+        )
+        body_rows.append(
+            "<tr>"
+            + "".join(
+                f'<td class="{cls}">{val}</td>'
+                for val, cls in zip(row_vals, _OP_COL_ALIGN)
             )
+            + "</tr>"
+        )
 
-        op_sections_html.append(
-            '<div class="operation-section">'
+    if body_rows:
+        header_cells = "".join(
+            f'<th class="{cls}">{_esc(h)}</th>'
+            for h, cls in zip(_OP_TABLE_HEADERS, _OP_COL_ALIGN)
+        )
+        operation_table_html = (
+            '<div class="operation-table-wrap">'
             '<table class="op-sheet-table operation-table">'
             + _OP_TABLE_COLGROUP
-            + "<thead>"
-            + f'<tr class="operation-section-title"><td colspan="7">{title}</td></tr>'
-            + "<tr>"
-            + f'<th>Tool#</th>'
-            + f'<th>Block#</th>'
-            + f'<th>Operation Comment</th>'
-            + f'<th>Tool Description</th>'
-            + f'<th>H offsets</th>'
-            + f'<th>D offsets</th>'
-            + f'<th>Remark</th>'
+            + "<thead><tr>"
+            + header_cells
             + "</tr></thead><tbody>"
             + "".join(body_rows)
             + "</tbody></table></div>"
         )
+    else:
+        operation_table_html = ""
 
     op_style = """<style type="text/css">
 .setup-sheet-page { font-family: Arial, Helvetica, sans-serif; background: #fff; color: #000; }
@@ -620,18 +669,24 @@ def build_one_page_html(
 .sheet-section-body { font-size: 10px; }
 .machine-fixture-row { margin-top: 6px; }
 .setup-notes-wrap { margin-top: 6px; border: 1px solid #000; }
-.operation-section { margin-top: 8px; break-inside: auto; }
-.operation-section:first-of-type { margin-top: 6px; page-break-before: auto; break-before: auto; }
+.operation-table-wrap { margin-top: 8px; }
 .op-sheet-table { table-layout: fixed; width: 100%; border-collapse: collapse; margin-top: 0; }
 .op-sheet-table th { font-size: 10px; font-weight: bold; border: 1px solid #000; padding: 2px 4px;
-  height: 16px; vertical-align: middle; box-sizing: border-box; background: #e8e8e8;
+  height: 16px; box-sizing: border-box; background: #e8e8e8;
   white-space: normal; }
 .op-sheet-table td { font-size: 9px; border: 1px solid #000; padding: 2px 4px;
-  min-height: 16px; height: auto; vertical-align: top; box-sizing: border-box;
+  min-height: 16px; height: auto; box-sizing: border-box;
   overflow: visible; white-space: normal; word-break: break-word; overflow-wrap: anywhere; }
-.operation-section-title td { background: #b4d7ee; font-size: 11px; font-weight: bold; text-align: center;
-  padding: 4px; border: 1px solid #000; break-after: avoid; page-break-after: avoid; }
+.op-sheet-table .center-col {
+  text-align: center;
+  vertical-align: middle;
+}
+.op-sheet-table .left-col {
+  text-align: left;
+  vertical-align: top;
+}
 .operation-table thead { display: table-header-group; }
+.operation-table tbody tr { break-inside: avoid; page-break-inside: avoid; }
 .prepared-row { margin-top: 6px; font-size: 10px; }
 .prepared-row td { padding: 4px 6px; border: 1px solid #000; }
 .sheet-beta-footer {
@@ -666,16 +721,22 @@ def build_one_page_html(
   }
   .logo-text-screen { display: none !important; }
   .logo-text-print { display: inline !important; }
-  .operation-section { break-inside: auto; page-break-inside: auto; }
-  .operation-section:first-of-type { margin-top: 6px; page-break-before: auto; break-before: auto; }
+  .operation-table-wrap { break-inside: auto; page-break-inside: auto; }
   .operation-table { break-inside: auto; page-break-inside: auto; }
-  .operation-section-title { break-after: avoid; page-break-after: avoid; }
   .operation-table thead { display: table-header-group; }
-  tr { break-inside: avoid; page-break-inside: avoid; }
+  .operation-table tbody tr { break-inside: avoid; page-break-inside: avoid; }
   .op-sheet-table td {
     height: auto !important;
     overflow: visible !important;
     white-space: normal !important;
+  }
+  .op-sheet-table .center-col {
+    text-align: center !important;
+    vertical-align: middle !important;
+  }
+  .op-sheet-table .left-col {
+    text-align: left !important;
+    vertical-align: top !important;
   }
 }
 </style>"""
@@ -722,7 +783,7 @@ def build_one_page_html(
 <div class="sheet-section-body setup-notes-value">{setup_notes_html}</div>
 </div>
 
-{"".join(op_sections_html)}
+{operation_table_html}
 
 <table class="prepared-row" style="width:100%;border-collapse:collapse;">
 <tr>

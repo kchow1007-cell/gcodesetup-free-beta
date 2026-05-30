@@ -6,6 +6,7 @@ UNITS_RE = re.compile(r"G(20|21)", re.IGNORECASE)
 WCS_RE = re.compile(r"G(5[4-9])(?:P(\d+))?(?!P)", re.IGNORECASE)
 TOOL_RE = re.compile(r"(?<![A-Z0-9#])T(\d+)", re.IGNORECASE)
 G43_G44_RE = re.compile(r"G4[34]", re.IGNORECASE)
+_HAAS_TCP_G234_RE = re.compile(r"\bG234\b", re.IGNORECASE)
 # Integer tool-length H only (H01→H1); rejects H0.03 / macro decimals on G43/G44 lines.
 G43_G44_H_RE = re.compile(r"H0*([1-9]\d*)(?![0-9.])", re.IGNORECASE)
 G41_G42_RE = re.compile(r"G4[12]", re.IGNORECASE)
@@ -101,7 +102,9 @@ def _extract_tool_length_h_offsets(clean_line):
     Tool-length H registers from G43/G44 only (not G65 macros or decimal H0.03).
     Returns normalized values such as H1, H3, H10.
     """
-    if not clean_line or not G43_G44_RE.search(clean_line):
+    if not clean_line or not (
+        G43_G44_RE.search(clean_line) or _HAAS_TCP_G234_RE.search(clean_line)
+    ):
         return []
     found = []
     for match in G43_G44_H_RE.finditer(clean_line):
@@ -655,6 +658,7 @@ def _parse_semicolon_tool_comment(comment):
 _IGNORED_COMMENT_TERMS = (
     "TOOLPLANE",
     "MASTERCAM",
+    "MCAM FILE",
     "MCX FILE",
     "MATERIAL",
     "PROGRAM",
@@ -670,6 +674,10 @@ _IGNORED_COMMENT_TERMS = (
     "R-GEOM",
     "LENGTH AND WEAR",
     "M30",
+    "C-AXIS UNLOCK",
+    "C-AXIS LOCK",
+    "B-AXIS UNLOCK",
+    "B-AXIS LOCK",
 )
 
 # Makino / ProNC preamble lines — never operation or tool description.
@@ -1664,7 +1672,33 @@ def _standalone_tool_change_covered_by_n_block(lines, idx, lookback=30):
     return False
 
 
-def _is_operation_start(lines, idx, fusion_mode=False):
+def _n_line_has_fanuc_tool_change(clean_line: str) -> bool:
+    """``N130 T1 M06`` — Fanuc/Haas tool change on the same N line."""
+    return bool(
+        M6_RE.search(clean_line)
+        and (
+            TOOL_RE.search(clean_line)
+            or _tool_number_from_tool_change_line(clean_line)
+        )
+    )
+
+
+def _program_has_dense_n_blocks(lines: list[str]) -> bool:
+    """
+    Haas/Fanuc programs with N on nearly every line but few N-line tool changes.
+    """
+    n_count = 0
+    tool_change_n = 0
+    for raw in lines:
+        if not BLOCK_START_RE.match(raw):
+            continue
+        n_count += 1
+        if _n_line_has_fanuc_tool_change(_clean_line(raw)):
+            tool_change_n += 1
+    return n_count >= 8 and tool_change_n <= max(1, n_count // 4)
+
+
+def _is_operation_start(lines, idx, fusion_mode=False, dense_n_fanuc=False):
     raw_line = lines[idx]
     clean_line = _clean_line(raw_line)
 
@@ -1675,6 +1709,12 @@ def _is_operation_start(lines, idx, fusion_mode=False):
             return False
         if fusion_mode:
             return _line_has_fusion_toolpath_start(raw_line)
+        if dense_n_fanuc:
+            if _n_line_has_fanuc_tool_change(clean_line):
+                return True
+            if _tool_number_from_g100_line(clean_line):
+                return True
+            return False
         if (
             TOOL_RE.search(clean_line)
             or M6_RE.search(clean_line)
@@ -1712,6 +1752,7 @@ def _parse_operation_blocks(lines, header_tool_map):
     operation_blocks = []
     operation_start_indexes = []
     fusion_mode = _program_has_fusion_toolpath(lines)
+    dense_n_fanuc = _program_has_dense_n_blocks(lines)
     fusion_active = {
         "tool_number": None,
         "tool_description": None,
@@ -1719,7 +1760,9 @@ def _parse_operation_blocks(lines, header_tool_map):
         "h_offsets": None,
     }
     for idx in range(len(lines)):
-        if _is_operation_start(lines, idx, fusion_mode=fusion_mode):
+        if _is_operation_start(
+            lines, idx, fusion_mode=fusion_mode, dense_n_fanuc=dense_n_fanuc
+        ):
             operation_start_indexes.append(idx)
     if not operation_start_indexes:
         return operation_blocks
@@ -1877,6 +1920,49 @@ def _parse_operation_blocks(lines, header_tool_map):
     return operation_blocks
 
 
+def _select_operation_blocks(
+    gcode_text: str,
+    lines: list[str],
+    header_tool_map: dict,
+    program_type: str,
+) -> list[dict]:
+    """
+    Universal operation-block parser, or a post-specific profile when detection is strong.
+    """
+    from parser_profiles.doosan_mastercam_lathe import (
+        is_doosan_mastercam_2axis_lathe_profile,
+        is_doosan_mastercam_lathe_millturn_profile,
+        parse_doosan_mastercam_2axis_lathe,
+        parse_doosan_mastercam_lathe_millturn,
+    )
+    from parser_profiles.dmg_dmf_siemens_5axis import (
+        is_dmg_dmf_siemens_5axis_profile,
+        parse_dmg_dmf_siemens_5axis,
+    )
+    from parser_profiles.heidenhain_tnc_5axis import (
+        is_heidenhain_tnc_5axis_profile,
+        parse_heidenhain_tnc_5axis,
+    )
+
+    if is_doosan_mastercam_2axis_lathe_profile(gcode_text, program_type):
+        blocks = parse_doosan_mastercam_2axis_lathe(gcode_text)
+        if blocks:
+            return blocks
+    if is_doosan_mastercam_lathe_millturn_profile(gcode_text, program_type):
+        blocks = parse_doosan_mastercam_lathe_millturn(gcode_text)
+        if blocks:
+            return blocks
+    if is_heidenhain_tnc_5axis_profile(gcode_text, program_type):
+        blocks = parse_heidenhain_tnc_5axis(gcode_text)
+        if blocks:
+            return blocks
+    if is_dmg_dmf_siemens_5axis_profile(gcode_text, program_type):
+        blocks = parse_dmg_dmf_siemens_5axis(gcode_text)
+        if blocks:
+            return blocks
+    return _parse_operation_blocks(lines, header_tool_map)
+
+
 def parse_gcode(text):
     lines = text.splitlines()
     program_number = None
@@ -1968,7 +2054,14 @@ def parse_gcode(text):
 
     program_header, header_tool_table = _parse_program_header_and_tool_table(lines)
     header_tool_map = {row["tool_number"]: row for row in header_tool_table}
-    operation_blocks = _parse_operation_blocks(lines, header_tool_map)
+
+    program_type_detection = detect_program_type(text)
+    operation_blocks = _select_operation_blocks(
+        text,
+        lines,
+        header_tool_map,
+        program_type_detection["program_type"],
+    )
 
     if program_header["program_number"] == "-" and program_number:
         program_header["program_number"] = program_number
@@ -1980,4 +2073,831 @@ def parse_gcode(text):
         "program_header": program_header,
         "header_tool_table": header_tool_table,
         "operation_blocks": operation_blocks,
+        "program_type_detection": program_type_detection,
     }
+
+
+PROGRAM_TYPE_MILLING = "Milling"
+PROGRAM_TYPE_LATHE = "Lathe / Turning"
+PROGRAM_TYPE_MILL_TURN = "Mill-Turn"
+PROGRAM_TYPE_SWISS = "Swiss"
+PROGRAM_TYPE_UNKNOWN = "Unknown"
+
+_PROGRAM_TYPE_VALUES = (
+    PROGRAM_TYPE_MILLING,
+    PROGRAM_TYPE_LATHE,
+    PROGRAM_TYPE_MILL_TURN,
+    PROGRAM_TYPE_SWISS,
+    PROGRAM_TYPE_UNKNOWN,
+)
+
+MILLING_TYPE_3_AXIS = "3-Axis Milling"
+MILLING_TYPE_4_AXIS = "4-Axis Milling"
+MILLING_TYPE_5_AXIS = "5-Axis Milling"
+MILLING_TYPE_UNKNOWN = "Unknown Milling"
+
+LATHE_TYPE_2_AXIS = "2-Axis Lathe"
+LATHE_TYPE_MILL_TURN = "Mill-Turn / Live Tooling"
+LATHE_TYPE_SWISS = "Swiss"
+LATHE_TYPE_UNKNOWN = "Unknown Lathe"
+
+_LATHE_TOOL_RE = re.compile(r"\bT0[1-9]\d{2}\b", re.IGNORECASE)
+_MOTION_AXIS_COORD_RE = {
+    axis: re.compile(
+        r"(?<![A-Z])"
+        + axis
+        + r"\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))(?![A-Z0-9])",
+        re.IGNORECASE,
+    )
+    for axis in ("X", "Y", "Z")
+}
+_LATHE_TURNING_CYCLE_RE = re.compile(r"\bG76\b|\bG7[12]\b|\bG70\b", re.IGNORECASE)
+_LATHE_SPINDLE_CSS_RE = re.compile(r"\bG9[67]\b", re.IGNORECASE)
+_LATHE_G50_G99_RE = re.compile(r"\bG50\b|\bG99\b", re.IGNORECASE)
+_LATHE_OPERATION_COMMENT_RE = re.compile(
+    r"\b(?:LATHE\s+TOOL|OD\s+THREAD|INSERT|CENTER\s+DRILL|BORING|GROOVE|THREAD)\b",
+    re.IGNORECASE,
+)
+_LIVE_TOOL_COMMENT_RE = re.compile(
+    r"\b(?:USING\s+Y-AXIS|C-AXIS|CROSS\s+DRILL|LIVE\s+TOOL)\b",
+    re.IGNORECASE,
+)
+_DRILL_CYCLE_RE = re.compile(r"\bG8[123]\b", re.IGNORECASE)
+# G81G98 / G83G99 style (no word boundary between cycle and mode letter)
+_DRILL_CYCLE_LOOSE_RE = re.compile(r"\bG8[123](?:\b|[A-Z])", re.IGNORECASE)
+# Rotary motion on comment-stripped lines only (avoids .02CR, comment text).
+_ROTARY_AXIS_MOTION_RE = re.compile(
+    r"(?<![A-Z])([ABC])\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))(?![A-Z0-9])",
+    re.IGNORECASE,
+)
+_FIVE_AXIS_CODE_PATTERNS = (
+    (r"\bG68\.2\b", "Found G68.2 tilted work plane"),
+    (r"\bG43\.4\b", "Found G43.4 tool center point control"),
+    (r"\bG43\.5\b", "Found G43.5 five-axis tool length control"),
+    (r"\bG53\.1\b", "Found G53.1"),
+    (r"\bTRAORI\b", "Found TRAORI five-axis transform"),
+    (r"\bCYCLE800\b", "Found CYCLE800 tilted work plane"),
+    (r"\bM128\b", "Found M128 TCPM / 5-axis control"),
+    (r"\bPLANE\s+SPATIAL\b", "Found PLANE SPATIAL"),
+    (r"\bTCP\b", "Found TCP / tool center point"),
+    (r"\bTCPC\b", "Found TCPC"),
+    (r"\bRTCP\b", "Found RTCP"),
+    (r"\bDWO\b", "Found dynamic work offset (DWO)"),
+    (r"\bTILTED\s+WORK\s+PLANE\b", "Found tilted work plane"),
+    (r"\bTOOL\s+CENTER\s+POINT\b", "Found tool center point"),
+    (r"\bDYNAMIC\s+WORK\s+OFFSET\b", "Found dynamic work offset"),
+)
+_PLANE_G17_RE = re.compile(r"\bG17\b", re.IGNORECASE)
+_PLANE_G18_RE = re.compile(r"\bG18\b", re.IGNORECASE)
+_PLANE_G19_RE = re.compile(r"\bG19\b", re.IGNORECASE)
+_SPINDLE_M3_M4_RE = re.compile(r"\bM[34]\b", re.IGNORECASE)
+_SWISS_SYNC_G_RE = re.compile(r"\bG3[01]0\b|\bG600\b", re.IGNORECASE)
+
+
+def _program_type_comment_blob(gcode_text: str) -> str:
+    parts = []
+    for raw in gcode_text.splitlines():
+        parts.extend(_extract_comments_from_line(raw))
+        semi = _extract_semicolon_comment(raw)
+        if semi:
+            parts.append(semi)
+    return " ".join(parts)
+
+
+def _program_type_scan_lines(gcode_text: str) -> list[str]:
+    return [_clean_line(line) for line in gcode_text.splitlines() if line.strip()]
+
+
+def _axis_mention_counts(clean_lines: list[str]) -> dict[str, int]:
+    counts = {"X": 0, "Y": 0, "Z": 0}
+    for line in clean_lines:
+        for axis in counts:
+            if re.search(r"\b" + axis + r"(?=[^A-Za-z]|$)", line, re.IGNORECASE):
+                counts[axis] += 1
+    return counts
+
+
+def _has_axis_motion_on_lines(clean_lines: list[str], axis: str) -> bool:
+    """True when a comment-stripped line has a numeric coordinate for X, Y, or Z."""
+    pattern = _MOTION_AXIS_COORD_RE.get(axis.upper())
+    if not pattern:
+        return False
+    return any(pattern.search(line) for line in clean_lines)
+
+
+def _has_c_axis_motion_on_lines(clean_lines: list[str]) -> bool:
+    usage, _active, _simul = _analyze_rotary_axis_motion(clean_lines)
+    return usage.get("C", 0) > 0
+
+
+def _lathe_tool_labels(clean_blob: str, limit: int = 8) -> str:
+    tools = sorted(
+        {
+            m.group(0).upper()
+            for m in _LATHE_TOOL_RE.finditer(clean_blob)
+            if not m.group(0).upper().endswith("00")
+        }
+    )
+    if not tools:
+        tools = sorted({m.group(0).upper() for m in _LATHE_TOOL_RE.finditer(clean_blob)})
+    if not tools:
+        return ""
+    return "/".join(tools[:limit])
+
+
+def _has_g28_uw_return(clean_lines: list[str]) -> bool:
+    for line in clean_lines:
+        if re.search(r"\bG28\b", line, re.IGNORECASE) and re.search(
+            r"\bU", line, re.IGNORECASE
+        ) and re.search(r"\bW", line, re.IGNORECASE):
+            return True
+    return False
+
+
+def _analyze_rotary_axis_motion(clean_lines: list[str]) -> tuple[dict[str, int], set[str], bool]:
+    """
+    Count A/B/C rotary addresses on comment-stripped motion lines only.
+    Returns (per-axis counts, active axis letters, simultaneous multi-rotary on one line).
+    """
+    usage = {"A": 0, "B": 0, "C": 0}
+    simultaneous = False
+    for line in clean_lines:
+        letters_on_line: list[str] = []
+        for match in _ROTARY_AXIS_MOTION_RE.finditer(line):
+            letter = match.group(1).upper()
+            usage[letter] += 1
+            letters_on_line.append(letter)
+        if len(set(letters_on_line)) >= 2:
+            simultaneous = True
+    active = {letter for letter, count in usage.items() if count > 0}
+    return usage, active, simultaneous
+
+
+def _is_vmc_5axis_milling_context(
+    clean_blob: str,
+    lathe_t_hits: int,
+    has_m6: bool,
+    rotary_active: set[str],
+) -> bool:
+    """
+    5-axis VMC milling (Fanuc, Siemens, Heidenhain) — B/C rotary is not mill-turn evidence.
+    """
+    if lathe_t_hits:
+        return False
+    if (
+        has_m6
+        and re.search(r"\bCYCLE800\b", clean_blob, re.IGNORECASE)
+        and re.search(r"\bTRAORI\b", clean_blob, re.IGNORECASE)
+    ):
+        return True
+    if (
+        re.search(r"\bBEGIN\s+PGM\b", clean_blob, re.IGNORECASE)
+        and re.search(r"\bTOOL\s+CALL\b", clean_blob, re.IGNORECASE)
+        and (
+            re.search(r"\bM128\b", clean_blob, re.IGNORECASE)
+            or re.search(r"\bCYCL\s+DEF\b", clean_blob, re.IGNORECASE)
+            or re.search(r"\bPLANE\s+(?:RESET|SPATIAL)\b", clean_blob, re.IGNORECASE)
+        )
+    ):
+        return True
+    five_on_motion = sum(
+        1 for pattern, _reason in _FIVE_AXIS_CODE_PATTERNS
+        if re.search(pattern, clean_blob, re.IGNORECASE)
+    )
+    if five_on_motion >= 2:
+        return True
+    if (
+        has_m6
+        and len(rotary_active) >= 2
+        and (
+            re.search(r"\bG43\.4\b", clean_blob, re.IGNORECASE)
+            or re.search(r"\bG68\.2\b", clean_blob, re.IGNORECASE)
+            or re.search(r"\bG53\.1\b", clean_blob, re.IGNORECASE)
+        )
+    ):
+        return True
+    return False
+
+
+def _collect_5axis_milling_evidence(
+    clean_blob: str,
+    clean_lines: list[str],
+    axis_counts: dict[str, int],
+    rotary_active: set[str],
+    has_m6: bool,
+) -> tuple[int, list[str]]:
+    """Strong 5-axis milling clues for confidence and display (one reason per line)."""
+    reasons: list[str] = []
+
+    def _add(reason: str) -> None:
+        if reason not in reasons:
+            reasons.append(reason)
+
+    if _has_milling_tool_changes(clean_lines, clean_blob):
+        _add("Found T# M6 milling tool change")
+    if re.search(r"\bG54P\d", clean_blob, re.IGNORECASE):
+        _add("Found G54P# work offsets")
+    elif re.search(r"\bG54\b", clean_blob, re.IGNORECASE):
+        _add("Found G54 work offset")
+    for pattern, reason in _FIVE_AXIS_CODE_PATTERNS:
+        if re.search(pattern, clean_blob, re.IGNORECASE):
+            _add(reason)
+    if len(rotary_active) >= 2:
+        axes_label = " and ".join(sorted(rotary_active))
+        _add("Found %s rotary axes" % axes_label)
+    has_xyz = bool(axis_counts.get("X") and axis_counts.get("Y") and axis_counts.get("Z"))
+    if has_xyz and len(rotary_active) >= 2:
+        rc = "/".join(sorted(rotary_active))
+        _add("Found simultaneous XYZ + %s motion" % rc)
+    return len(reasons), reasons
+
+
+def _confidence_for_milling_with_subtype(
+    milling_type: str | None,
+    strong_milling: int,
+    strong_millturn: int,
+    lathe_t_hits: int,
+    five_axis_evidence: int,
+    rotary_axis_count: int,
+    has_m6: bool,
+) -> str:
+    if lathe_t_hits == 0 and milling_type == MILLING_TYPE_5_AXIS:
+        if five_axis_evidence >= 2:
+            return "High"
+        if five_axis_evidence >= 1 and strong_milling >= 3:
+            return "High"
+        if rotary_axis_count >= 2 and has_m6 and strong_milling >= 3:
+            return "High"
+        if five_axis_evidence >= 1:
+            return "Medium"
+    if milling_type == MILLING_TYPE_4_AXIS and strong_milling >= 3 and lathe_t_hits == 0:
+        return "Medium" if strong_milling < 5 else "High"
+    if milling_type == MILLING_TYPE_3_AXIS:
+        if strong_milling >= 5 and strong_millturn == 0:
+            return "High"
+        if strong_milling >= 4 and strong_millturn == 0:
+            return "High"
+        if strong_milling >= 3 and strong_millturn == 0:
+            return "Medium"
+    if strong_milling >= 5 and strong_millturn == 0 and lathe_t_hits == 0:
+        return "High"
+    if strong_milling >= 4 and strong_millturn == 0 and lathe_t_hits == 0:
+        return "High"
+    if strong_milling >= 3 and strong_millturn == 0 and lathe_t_hits == 0:
+        return "Medium"
+    return "Low"
+
+
+def _detect_five_axis_codes(clean_blob: str, combined_up: str) -> tuple[int, list[str]]:
+    """G-code five-axis transforms (motion) plus strong post phrases in comments."""
+    score = 0
+    reasons: list[str] = []
+    for pattern, reason in _FIVE_AXIS_CODE_PATTERNS:
+        if re.search(pattern, clean_blob, re.IGNORECASE):
+            score += 2
+            reasons.append(reason)
+        elif re.search(pattern, combined_up, re.IGNORECASE):
+            score += 1
+            reasons.append(reason)
+    return score, reasons
+
+
+def _detect_milling_subtype(
+    clean_lines: list[str],
+    clean_blob: str,
+    combined_up: str,
+    axis_counts: dict[str, int],
+) -> tuple[str | None, list[str]]:
+    """
+    3/4/5-axis milling subtype when top-level type is Milling.
+    Rotary clues use comment-stripped lines only.
+    """
+    subtype_reasons: list[str] = []
+    rotary_usage, rotary_active, simultaneous_rotary = _analyze_rotary_axis_motion(clean_lines)
+    five_score, five_reasons = _detect_five_axis_codes(clean_blob, combined_up)
+
+    if five_score >= 2 or len(rotary_active) >= 2 or simultaneous_rotary:
+        if five_reasons:
+            subtype_reasons.extend(five_reasons[:4])
+        if len(rotary_active) >= 2:
+            axes_label = " and ".join(sorted(rotary_active))
+            subtype_reasons.append("Found %s rotary axes" % axes_label)
+            if axis_counts.get("X") and axis_counts.get("Y") and axis_counts.get("Z"):
+                rc = "/".join(sorted(rotary_active))
+                subtype_reasons.append("Found simultaneous XYZ + %s motion" % rc)
+        elif simultaneous_rotary:
+            subtype_reasons.append("Found simultaneous rotary axes on one line")
+        return MILLING_TYPE_5_AXIS, subtype_reasons
+
+    if len(rotary_active) == 1:
+        axis = next(iter(rotary_active))
+        hits = rotary_usage[axis]
+        subtype_reasons.append(
+            "Found %s-axis positioning/motion (%d line(s))" % (axis, hits)
+        )
+        return MILLING_TYPE_4_AXIS, subtype_reasons
+
+    has_xyz = bool(axis_counts.get("X") and axis_counts.get("Y") and axis_counts.get("Z"))
+    if (
+        has_xyz
+        or _PLANE_G17_RE.search(clean_blob)
+        or G43_G44_RE.search(clean_blob)
+        or M6_RE.search(clean_blob)
+    ):
+        subtype_reasons.append("No rotary A/B/C motion on program lines")
+        return MILLING_TYPE_3_AXIS, subtype_reasons
+
+    return MILLING_TYPE_UNKNOWN, subtype_reasons + ["Milling detected but axis clues are weak"]
+
+
+def format_program_type_label(
+    program_type: str,
+    milling_type: str | None = None,
+    lathe_type: str | None = None,
+) -> str:
+    """Display label for UI, e.g. ``Milling — 5-Axis Milling`` or ``Lathe / Turning — 2-Axis Lathe``."""
+    if program_type == PROGRAM_TYPE_MILLING and milling_type:
+        return "%s — %s" % (program_type, milling_type)
+    if program_type == PROGRAM_TYPE_LATHE and lathe_type:
+        return "%s — %s" % (program_type, lathe_type)
+    return program_type
+
+
+def _confidence_from_scores(winner_score: int, runner_up: int, reason_count: int) -> str:
+    margin = winner_score - runner_up
+    if winner_score >= 6 and margin >= 2 and reason_count >= 3:
+        return "High"
+    if winner_score >= 3 and margin >= 1:
+        return "Medium"
+    return "Low"
+
+
+# Turning comments only — excludes macro text like "(1= TURN ON)" or "TOOL COUNTER".
+_LATHE_COMMENT_TURNING_RE = re.compile(
+    r"\b(?:TURNING\b|OD\s+TURN|ID\s+TURN|FACING\b|GROOVING\b|THREADING\b)",
+    re.IGNORECASE,
+)
+
+
+def _has_milling_tool_changes(clean_lines: list[str], clean_blob: str) -> bool:
+    """T#M6, M6 T#, T# on the same line as M6, or Siemens ``T="name"`` then M6."""
+    if TOOL_CHANGE_SAME_LINE_RE.search(clean_blob):
+        return True
+    if re.search(r'T\s*=\s*"[^"]+"', clean_blob, re.IGNORECASE) and M6_RE.search(clean_blob):
+        return True
+    for line in clean_lines:
+        if M6_RE.search(line) and TOOL_RE.search(line):
+            return True
+    return False
+
+
+def _collect_strong_milling_clues(
+    clean_blob: str, clean_lines: list[str], axis_counts: dict[str, int]
+) -> tuple[int, list[str]]:
+    """Motion-based milling clues (comment-stripped program lines only)."""
+    reasons: list[str] = []
+
+    def _add(reason: str) -> None:
+        if reason not in reasons:
+            reasons.append(reason)
+
+    if _has_milling_tool_changes(clean_lines, clean_blob):
+        _add("Found T#M6 milling tool changes")
+    if G43_G44_RE.search(clean_blob):
+        _add("Found G43/G44 tool length compensation")
+    if _DRILL_CYCLE_RE.search(clean_blob) or _DRILL_CYCLE_LOOSE_RE.search(clean_blob):
+        _add("Found G81/G82/G83 drilling cycles")
+    if _PLANE_G17_RE.search(clean_blob):
+        _add("Found G17 XY plane")
+    if axis_counts.get("X") and axis_counts.get("Y") and axis_counts.get("Z"):
+        _add("Found X/Y/Z milling motion")
+    wcs_hits = WCS_RE.findall(clean_blob)
+    if wcs_hits:
+        if any(p for _g, p in wcs_hits if p):
+            _add("Found G54P# work offsets")
+        else:
+            _add("Found G54-G59 work offsets")
+    return len(reasons), reasons
+
+
+def _collect_live_tool_clues(
+    clean_blob: str,
+    clean_lines: list[str],
+    comments_up: str,
+    lathe_t_hits: int,
+    has_m6: bool,
+) -> tuple[int, list[str]]:
+    """Live-tool / mill-turn evidence — requires lathe T-calls at classification time."""
+    if not lathe_t_hits:
+        return 0, []
+
+    reasons: list[str] = []
+
+    def _add(reason: str) -> None:
+        if reason not in reasons:
+            reasons.append(reason)
+
+    _rotary_usage, rotary_active, _simul = _analyze_rotary_axis_motion(clean_lines)
+    vmc_5axis = _is_vmc_5axis_milling_context(
+        clean_blob, lathe_t_hits, has_m6, rotary_active
+    )
+    y_motion = _has_axis_motion_on_lines(clean_lines, "Y")
+    c_motion = _has_c_axis_motion_on_lines(clean_lines) and not vmc_5axis
+
+    if y_motion:
+        _add("Found Y-axis live-tool motion")
+    if c_motion:
+        _add("Found C-axis motion")
+
+    has_g17 = bool(_PLANE_G17_RE.search(clean_blob))
+    has_g19 = bool(_PLANE_G19_RE.search(clean_blob))
+    if has_g17 or has_g19:
+        _add("Found G17/G19 live-tool plane selects")
+
+    if _LIVE_TOOL_COMMENT_RE.search(comments_up):
+        _add("Found live-tool operation comment")
+
+    for phrase in ("LEFT SPINDLE", "RIGHT SPINDLE"):
+        if phrase in comments_up:
+            milling_comment = bool(
+                re.search(
+                    r"\b(?:END\s*MILL|ENDMILL|BALL\s+NOSE|FLAT\s+END|DRILL)\b",
+                    comments_up,
+                )
+            )
+            if milling_comment or y_motion or c_motion:
+                _add("Found %s live-tool spindle pattern" % phrase.title())
+                break
+
+    if re.search(
+        r"\b(?:END\s*MILL|ENDMILL|BALL\s+NOSE|FLAT\s+END)\b", comments_up
+    ) and (c_motion or y_motion):
+        _add("Found milling tool comment with C/Y positioning")
+
+    if has_m6 and lathe_t_hits and (y_motion or c_motion or has_g17 or has_g19):
+        _add("Found M6 tool change with live-tool motion")
+
+    return len(reasons), reasons
+
+
+def _collect_2axis_lathe_clues(
+    clean_blob: str,
+    clean_lines: list[str],
+    comments_up: str,
+    lathe_t_hits: int,
+    has_m6: bool,
+    live_tool_score: int,
+) -> tuple[int, list[str]]:
+    """Pure 2-axis turning clues when live-tool patterns are absent."""
+    reasons: list[str] = []
+    score = 0
+
+    def _add(reason: str, points: int = 1) -> None:
+        nonlocal score
+        if reason not in reasons:
+            reasons.append(reason)
+            score += points
+
+    if has_m6:
+        return 0, []
+
+    tool_label = _lathe_tool_labels(clean_blob)
+    if lathe_t_hits and tool_label:
+        _add("Found lathe-style %s tool calls" % tool_label, 2)
+
+    if re.search(r"\bG97\b", clean_blob, re.IGNORECASE):
+        _add("Found G97 spindle mode", 1)
+    elif _LATHE_SPINDLE_CSS_RE.search(clean_blob):
+        _add("Found G96/G97 spindle mode", 1)
+
+    if re.search(r"\bG76\b", clean_blob, re.IGNORECASE):
+        _add("Found G76 threading cycle", 2)
+    elif _LATHE_TURNING_CYCLE_RE.search(clean_blob):
+        _add("Found G71/G72/G70 turning cycle", 1)
+
+    if _LATHE_G50_G99_RE.search(clean_blob) and lathe_t_hits:
+        _add("Found G50/G99 lathe feed mode", 1)
+
+    if (
+        _has_axis_motion_on_lines(clean_lines, "X")
+        and _has_axis_motion_on_lines(clean_lines, "Z")
+        and not _has_axis_motion_on_lines(clean_lines, "Y")
+    ):
+        _add("Found X/Z turning motion", 2)
+
+    if _has_g28_uw_return(clean_lines):
+        _add("Found G28 U/W return", 1)
+
+    if _LATHE_OPERATION_COMMENT_RE.search(comments_up):
+        _add("Found lathe operation comment", 1)
+    elif _LATHE_COMMENT_TURNING_RE.search(comments_up):
+        _add("Found turning-style comment", 1)
+
+    if lathe_t_hits and live_tool_score == 0:
+        _add("No Y-axis or C-axis live-tool motion detected", 0)
+
+    return score, reasons
+
+
+def _collect_swiss_clues(clean_blob: str, combined_up: str) -> tuple[int, list[str]]:
+    swiss_reasons: list[str] = []
+    swiss_score = 0
+
+    def _add(reason: str, points: int) -> None:
+        nonlocal swiss_score
+        swiss_reasons.append(reason)
+        swiss_score += points
+
+    swiss_phrases = (
+        ("GUIDE BUSHING", "Found guide bushing reference", 3),
+        ("BAR FEED", "Found bar feeder reference", 2),
+        ("PICKOFF", "Found pickoff reference", 3),
+        ("PICK OFF", "Found pick off reference", 3),
+        ("SUB SPINDLE", "Found sub spindle reference", 3),
+        ("SUBSPINDLE", "Found subspindle reference", 3),
+        ("CUTOFF", "Found cutoff reference", 2),
+        ("CUT OFF", "Found cut off reference", 2),
+        ("BACKWORKING", "Found backworking reference", 3),
+        ("BACK WORKING", "Found back working reference", 3),
+        ("MAIN SPINDLE", "Found main spindle reference", 2),
+        ("CHANNEL", "Found channel reference", 1),
+        ("SYNC", "Found sync/wait reference", 1),
+    )
+    for needle, reason, pts in swiss_phrases:
+        if needle in combined_up:
+            _add(reason, pts)
+    if _SWISS_SYNC_G_RE.search(clean_blob):
+        _add("Found Swiss-style sync G-code (G300/G310/G600)", 3)
+    if re.search(r"\bWAIT\b|\bSYNC\b", combined_up) and (
+        "CHANNEL" in combined_up or "SUB SPINDLE" in combined_up
+    ):
+        _add("Found channel/sync wait pattern", 2)
+    return swiss_score, swiss_reasons
+
+
+def _program_type_confidence(
+    program_type: str,
+    strong_milling: int,
+    live_tool_score: int,
+    lathe_2axis_score: int,
+    swiss_score: int,
+    lathe_type: str | None = None,
+) -> str:
+    if program_type == PROGRAM_TYPE_MILLING:
+        if strong_milling >= 5 and live_tool_score == 0:
+            return "High"
+        if strong_milling >= 4 and live_tool_score == 0:
+            return "High"
+        if strong_milling >= 3 and live_tool_score == 0:
+            return "Medium"
+        return "Low"
+    if program_type == PROGRAM_TYPE_MILL_TURN:
+        if live_tool_score >= 2:
+            return "High"
+        if live_tool_score >= 1:
+            return "Medium"
+        return "Low"
+    if program_type == PROGRAM_TYPE_LATHE:
+        if lathe_type == LATHE_TYPE_2_AXIS:
+            if lathe_2axis_score >= 6:
+                return "High"
+            if lathe_2axis_score >= 4:
+                return "High"
+            if lathe_2axis_score >= 3:
+                return "Medium"
+        elif lathe_2axis_score >= 3:
+            return "Medium"
+        return "Low"
+    if program_type == PROGRAM_TYPE_SWISS:
+        return _confidence_from_scores(swiss_score, max(strong_milling, live_tool_score), 3)
+    return "Low"
+
+
+def detect_program_type(gcode_text: str) -> dict:
+    """
+    Heuristic CNC program family detection (milling, lathe, mill-turn, Swiss).
+    Does not alter parsing — for UI / future setup sheet templates only.
+    """
+    if not (gcode_text or "").strip():
+        return {
+            "program_type": PROGRAM_TYPE_UNKNOWN,
+            "milling_type": None,
+            "lathe_type": None,
+            "confidence": "Low",
+            "control_profile": None,
+            "reasons": ["Empty or unreadable program"],
+        }
+
+    comments_up = _program_type_comment_blob(gcode_text).upper()
+    combined_up = gcode_text.upper() + "\n" + comments_up
+    clean_lines = _program_type_scan_lines(gcode_text)
+    clean_blob = "\n".join(clean_lines)
+    axis_counts = _axis_mention_counts(clean_lines)
+    _rotary_usage, rotary_active, _rotary_simul = _analyze_rotary_axis_motion(clean_lines)
+
+    lathe_t_hits = len(_LATHE_TOOL_RE.findall(clean_blob))
+    has_m6 = bool(M6_RE.search(clean_blob))
+
+    strong_milling, milling_reasons = _collect_strong_milling_clues(
+        clean_blob, clean_lines, axis_counts
+    )
+    live_tool_score, live_tool_reasons = _collect_live_tool_clues(
+        clean_blob, clean_lines, comments_up, lathe_t_hits, has_m6
+    )
+    lathe_2axis_score, lathe_2axis_reasons = _collect_2axis_lathe_clues(
+        clean_blob,
+        clean_lines,
+        comments_up,
+        lathe_t_hits,
+        has_m6,
+        live_tool_score,
+    )
+    swiss_score, swiss_reasons = _collect_swiss_clues(clean_blob, combined_up)
+
+    program_type = PROGRAM_TYPE_UNKNOWN
+    lathe_type: str | None = None
+    type_reasons: list[str] = []
+    has_live_tool = lathe_t_hits > 0 and live_tool_score >= 1
+
+    if swiss_score >= 5 and swiss_score >= strong_milling and swiss_score >= lathe_2axis_score:
+        program_type = PROGRAM_TYPE_SWISS
+        lathe_type = LATHE_TYPE_SWISS
+        type_reasons = swiss_reasons
+    elif has_live_tool:
+        program_type = PROGRAM_TYPE_MILL_TURN
+        lathe_type = LATHE_TYPE_MILL_TURN
+        type_reasons = live_tool_reasons
+    elif strong_milling >= 4 and not has_live_tool:
+        program_type = PROGRAM_TYPE_MILLING
+        type_reasons = milling_reasons
+    elif (
+        lathe_t_hits > 0
+        and lathe_2axis_score >= 3
+        and live_tool_score == 0
+        and strong_milling < 4
+    ):
+        program_type = PROGRAM_TYPE_LATHE
+        lathe_type = LATHE_TYPE_2_AXIS
+        type_reasons = lathe_2axis_reasons
+    elif strong_milling >= 2 and not has_live_tool:
+        program_type = PROGRAM_TYPE_MILLING
+        type_reasons = milling_reasons
+    elif lathe_t_hits > 0 and lathe_2axis_score >= 2 and live_tool_score == 0:
+        program_type = PROGRAM_TYPE_LATHE
+        lathe_type = LATHE_TYPE_2_AXIS if lathe_2axis_score >= 3 else LATHE_TYPE_UNKNOWN
+        type_reasons = lathe_2axis_reasons
+    elif strong_milling >= 1:
+        program_type = PROGRAM_TYPE_MILLING
+        type_reasons = milling_reasons
+    elif lathe_t_hits > 0:
+        program_type = PROGRAM_TYPE_LATHE
+        lathe_type = LATHE_TYPE_UNKNOWN
+        type_reasons = lathe_2axis_reasons or ["Found lathe-style tool calls only"]
+    else:
+        program_type = PROGRAM_TYPE_UNKNOWN
+        type_reasons = ["Insufficient milling, lathe, mill-turn, or Swiss clues"]
+
+    confidence = _program_type_confidence(
+        program_type,
+        strong_milling,
+        live_tool_score,
+        lathe_2axis_score,
+        swiss_score,
+        lathe_type,
+    )
+    control_profile = None
+    five_axis_evidence_count = 0
+    five_axis_evidence_reasons: list[str] = []
+
+    deduped_reasons: list[str] = []
+    seen: set[str] = set()
+    for reason in type_reasons:
+        if reason not in seen:
+            seen.add(reason)
+            deduped_reasons.append(reason)
+
+    milling_type = None
+    if program_type == PROGRAM_TYPE_MILLING:
+        five_axis_evidence_count, five_axis_evidence_reasons = _collect_5axis_milling_evidence(
+            clean_blob, clean_lines, axis_counts, rotary_active, has_m6
+        )
+        milling_type, subtype_reasons = _detect_milling_subtype(
+            clean_lines, clean_blob, combined_up, axis_counts
+        )
+        if milling_type == MILLING_TYPE_5_AXIS and five_axis_evidence_reasons:
+            deduped_reasons = []
+            seen = set()
+            for reason in five_axis_evidence_reasons:
+                seen.add(reason)
+                deduped_reasons.append(reason)
+            for reason in subtype_reasons:
+                if reason not in seen:
+                    seen.add(reason)
+                    deduped_reasons.append(reason)
+        else:
+            for reason in subtype_reasons:
+                if reason not in seen:
+                    seen.add(reason)
+                    deduped_reasons.append(reason)
+        confidence = _confidence_for_milling_with_subtype(
+            milling_type,
+            strong_milling,
+            live_tool_score,
+            lathe_t_hits,
+            five_axis_evidence_count,
+            len(rotary_active),
+            has_m6,
+        )
+        if not lathe_t_hits:
+            neg = "No lathe-style T0101/T0202 tool calls"
+            if neg not in seen:
+                seen.add(neg)
+                deduped_reasons.append(neg)
+
+        from parser_profiles.dmg_dmf_siemens_5axis import (
+            dmg_profile_detection_reasons,
+            is_dmg_dmf_siemens_5axis_profile,
+        )
+        from parser_profiles.heidenhain_tnc_5axis import (
+            CONTROL_PROFILE_LABEL as _HEIDENHAIN_LABEL,
+            heidenhain_profile_detection_reasons,
+            is_heidenhain_tnc_5axis_profile,
+        )
+
+        if is_heidenhain_tnc_5axis_profile(gcode_text, program_type):
+            control_profile = _HEIDENHAIN_LABEL
+            milling_type = MILLING_TYPE_5_AXIS
+            confidence = "High"
+            for reason in heidenhain_profile_detection_reasons(gcode_text):
+                if reason not in seen:
+                    seen.add(reason)
+                    deduped_reasons.append(reason)
+            if len(rotary_active) >= 2:
+                axes_label = " and ".join(sorted(rotary_active))
+                r_bc = "Found B and C rotary axes" if axes_label == "B and C" else (
+                    "Found %s rotary axes" % axes_label
+                )
+                if r_bc not in seen:
+                    seen.add(r_bc)
+                    deduped_reasons.append(r_bc)
+            if axis_counts.get("X") and axis_counts.get("Y") and axis_counts.get("Z"):
+                r_xyzbc = "Found simultaneous XYZ + B/C motion"
+                if r_xyzbc not in seen:
+                    seen.add(r_xyzbc)
+                    deduped_reasons.append(r_xyzbc)
+            cp_reason = "Control profile: %s" % _HEIDENHAIN_LABEL
+            if cp_reason not in seen:
+                deduped_reasons.insert(0, cp_reason)
+                seen.add(cp_reason)
+        elif is_dmg_dmf_siemens_5axis_profile(gcode_text, program_type):
+            for reason in dmg_profile_detection_reasons(gcode_text):
+                if reason not in seen:
+                    seen.add(reason)
+                    deduped_reasons.append(reason)
+            if milling_type == MILLING_TYPE_5_AXIS:
+                confidence = "High"
+        elif (
+            milling_type == MILLING_TYPE_5_AXIS
+            and live_tool_score == 0
+            and not lathe_t_hits
+            and re.search(r"\bCYCLE800\b", clean_blob, re.IGNORECASE)
+            and re.search(r"\bTRAORI\b", clean_blob, re.IGNORECASE)
+            and has_m6
+        ):
+            if "Found Siemens MPF semicolon header" not in seen and re.search(
+                r"%_N_|;%_N_", gcode_text, re.IGNORECASE
+            ):
+                deduped_reasons.append("Found Siemens MPF semicolon header")
+                seen.add("Found Siemens MPF semicolon header")
+            confidence = "High"
+
+    if program_type == PROGRAM_TYPE_MILL_TURN:
+        from parser_profiles.doosan_mastercam_lathe import (
+            doosan_profile_detection_reasons,
+            is_doosan_mastercam_lathe_millturn_profile as _is_doosan_lathe_profile,
+        )
+
+        for reason in doosan_profile_detection_reasons(gcode_text):
+            if reason not in seen:
+                seen.add(reason)
+                deduped_reasons.append(reason)
+        if _is_doosan_lathe_profile(gcode_text, program_type):
+            confidence = "High"
+
+    return {
+        "program_type": program_type,
+        "milling_type": milling_type,
+        "lathe_type": lathe_type,
+        "confidence": confidence,
+        "control_profile": control_profile,
+        "reasons": deduped_reasons[:12],
+    }
+
+
+def is_doosan_mastercam_lathe_millturn_profile(gcode_text: str, program_type: str | None = None) -> bool:
+    """Re-export for tests and callers."""
+    from parser_profiles.doosan_mastercam_lathe import (
+        is_doosan_mastercam_lathe_millturn_profile as _is_profile,
+    )
+
+    return _is_profile(gcode_text, program_type)

@@ -30,6 +30,13 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+The app uses Streamlit multi-page navigation:
+
+- **Home / Tool** — upload G-code, edit setup sheet, preview, print/save PDF
+- **Plans** — Free Beta vs Pro (coming soon)
+- **About** — what GcodeSetup extracts
+- **Contact / Feedback** — parser feedback form
+
 ## Test files
 
 Use sample files in `samples/`:
