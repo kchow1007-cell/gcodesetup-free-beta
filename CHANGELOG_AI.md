@@ -44,6 +44,32 @@ Briefly describe what the user asked for.
 
 ---
 
+## 2026-05-29 — Streamlit Cloud ImportError Fix (home.py)
+
+### Task
+Fix Streamlit Cloud `ImportError: cannot import name 'MILLING_TYPE_3_AXIS' from 'gcode_parser'` by removing missing constant imports from `pages/home.py`.
+
+### Files Changed
+- `pages/home.py`
+- `CHANGELOG_AI.md`
+
+### What Changed
+- Removed `MILLING_TYPE_*` imports from `pages/home.py`.
+- Replaced `_MANUAL_PROGRAM_TYPE_MAP` milling subtype values with plain strings (`"3-Axis Milling"`, etc.).
+
+### What Was Not Changed
+- `gcode_parser.py` unchanged (no fake constants added).
+- Parser, detection, setup sheet, and operation row logic unchanged.
+
+### Test Notes
+- `from gcode_parser import ...` (home.py imports) succeeds locally.
+- Streamlit app starts without ImportError.
+
+### Follow-Up
+- Commit `pages/home.py` (and `CHANGELOG_AI.md` if tracking docs) to GitHub for Streamlit Cloud redeploy.
+
+---
+
 ## 2026-05-29 — Fanuc/Haas Dense N-Block Milling Operation Rows
 
 ### Task
